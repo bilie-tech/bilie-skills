@@ -1,0 +1,13 @@
+{
+  "name": "bilie-skills",
+  "owner": { "name": "Bilie Tech" },
+  "metadata": { "description": "Public skills from Bilie Tech." },
+  "plugins": [
+    {
+      "name": "applydesk",
+      "source": "./plugins/applydesk",
+      "description": "Job-application desk for career-services teams: client sittings for LinkedIn search, CV tailoring and scoring, employer form filling for a person to submit, guided Easy Apply, Pacten logging.",
+      "version": "0.2.0"
+    }
+  ]
+}

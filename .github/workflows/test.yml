@@ -1,0 +1,27 @@
+name: test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Unit tests
+        run: node --test "tests/*.test.mjs"
+      - name: End-to-end (real browser, practice job site)
+        env:
+          APPLYDESK_E2E: '1'
+        run: node --test tests/e2e.test.mjs
+      - name: Plugin manifest is valid JSON
+        shell: bash
+        run: node -e "for (const f of ['.claude-plugin/marketplace.json','plugins/applydesk/.claude-plugin/plugin.json','plugins/applydesk/hooks/hooks.json']) JSON.parse(require('fs').readFileSync(f,'utf8'))"

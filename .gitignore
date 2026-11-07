@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+*.tmp
+# Never commit client data or browser profiles
+/ApplyDesk/
+/profiles/
+*.har

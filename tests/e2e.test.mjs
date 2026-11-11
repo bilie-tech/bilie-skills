@@ -152,3 +152,38 @@ test('end to end on a practice job site', { skip: !run && 'set APPLYDESK_E2E=1 t
     server.close();
   }
 });
+
+// LinkedIn pages are never loaded in tests. Saved copies shaped like the 2026
+// layouts are read in a real browser with the same in-page functions the CLI uses.
+test('LinkedIn page reader and sign-in check on saved pages (real browser)', { skip: !run }, async () => {
+  const S = '../plugins/applydesk/skills/applydesk/scripts/lib';
+  const { jobSignalsInPage, parseJob } = await import(`${S}/lijob.mjs`);
+  const LI = await import(`${S}/linkedin.mjs`);
+  const { withProfile } = await import(`${S}/browser.mjs`);
+  const fixture = (n) => readFileSync(join(ROOT, 'tests/fixtures', n), 'utf8');
+  await withProfile('fixture-reader', async (ctx) => {
+    const page = await ctx.newPage();
+    await page.setContent(fixture('linkedin-job-signed-in.html'));
+    const j = parseJob(await page.evaluate(jobSignalsInPage), '4100000001', await page.content());
+    assert.equal(j.title, 'Senior Data Analyst');
+    assert.equal(j.company, 'Northwind Traders');
+    assert.equal(j.location, 'Toronto, ON');
+    assert.match(j.description, /^Northwind Traders is hiring a Senior Data Analyst/);
+    assert.match(j.description, /5\+ years in analytics/);
+    assert.doesNotMatch(j.description, /specialty foods|Contoso/);
+    assert.equal(j.route, 'employer_site');
+    assert.equal(j.complete, true);
+    assert.equal(LI.signedInFrom(await page.evaluate(LI.signInSignalsInPage)), true);
+
+    await page.setContent(fixture('linkedin-job-guest.html'));
+    const g = parseJob(await page.evaluate(jobSignalsInPage), '7', await page.content());
+    assert.equal(g.title, 'Data Analyst');
+    assert.equal(g.company, 'Acme');
+    assert.match(g.description, /Tableau/);
+    assert.equal(g.route, 'easy_apply');
+    assert.equal(LI.signedInFrom(await page.evaluate(LI.signInSignalsInPage)), false); // public page
+    await page.close();
+  });
+  const { closeProfile } = await import(`${S}/browser.mjs`);
+  await closeProfile('fixture-reader');
+});

@@ -5,7 +5,7 @@
 // its work and detaches, leaving the window (and any half-filled form) open.
 // Chrome encrypts the profile's cookies with this machine's key, so a profile
 // folder copied elsewhere is useless — which is what keeps sessions pinned.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { ensureDir, paths, readJson, writeJson, UserError } from './config.mjs';
@@ -39,12 +39,39 @@ export function findBrowser(env = process.env, platform = process.platform, exis
 
 const stateFile = (profile) => paths.state('browsers', `${profile}.json`);
 
-async function alive(port) {
+// A busy browser can take a few seconds to answer; two tries before calling it gone.
+async function alive(port, tries = 2) {
+  if (!port) return false;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function portFile(userDataDir) {
+  const file = join(userDataDir, 'DevToolsActivePort');
+  return existsSync(file) ? Number(readFileSync(file, 'utf8').split(/\r?\n/)[0]) || null : null;
+}
+
+export function pidAlive(pid) {
+  if (!pid) return false;
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) });
-    return res.ok;
-  } catch {
-    return false;
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+function killTree(pid) {
+  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
+  else {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {}
   }
 }
 
@@ -64,10 +91,24 @@ async function waitForPort(userDataDir, timeoutMs = 20000) {
 export async function openProfile(profile, { url = 'about:blank' } = {}) {
   const st = readJson(stateFile(profile));
   if (st && (await alive(st.port))) return st;
+  const userDataDir = ensureDir(paths.profile(profile));
+
+  // The window may still be open on a port we did not record: reconnect to it.
+  const port0 = portFile(userDataDir);
+  if (port0 && port0 !== st?.port && (await alive(port0))) {
+    const again = { ...(st || {}), profile, port: port0, reconnectedAt: new Date().toISOString() };
+    writeJson(stateFile(profile), again);
+    return again;
+  }
+  // Still running but no longer answering (e.g. after a timeout): close it cleanly,
+  // or a new start would just hand over to it and never open a port.
+  if (st?.pid && pidAlive(st.pid)) {
+    killTree(st.pid);
+    for (let i = 0; i < 20 && pidAlive(st.pid); i++) await new Promise((r) => setTimeout(r, 250));
+  }
 
   const exe = findBrowser();
   if (!exe) throw new UserError('No Chrome or Edge found. Install Google Chrome, or set APPLYDESK_BROWSER to the browser path.');
-  const userDataDir = ensureDir(paths.profile(profile));
   rmSync(join(userDataDir, 'DevToolsActivePort'), { force: true });
   const args = [
     `--user-data-dir=${userDataDir}`,
@@ -84,7 +125,7 @@ export async function openProfile(profile, { url = 'about:blank' } = {}) {
   const port = await waitForPort(userDataDir);
   if (!port) {
     throw new UserError(
-      `The browser for "${profile}" did not start. If a window for this profile is already open without ApplyDesk, close it and try again.`,
+      `ApplyDesk could not open or reach the browser window for "${profile}". A window for it is probably still open but no longer connected. Close that window (check the taskbar for a second Chrome or Edge window), then run the same command again.`,
     );
   }
   const state = { profile, port, pid: child.pid, exe, startedAt: new Date().toISOString() };

@@ -12,7 +12,7 @@
 import { appendJsonl, paths, readJson, writeJson, machineId } from './config.mjs';
 
 export const ALLOW = [
-  /^https:\/\/www\.linkedin\.com\/jobs\/(search|view|collections)\b/,
+  /^https:\/\/www\.linkedin\.com\/jobs\/(search|search-results|view|collections)\b/,
   /^https:\/\/www\.linkedin\.com\/jobs\/?(\?.*)?$/,
   /^https:\/\/www\.linkedin\.com\/feed\/?(\?.*)?$/, // landing page after sign-in
   /^https:\/\/www\.linkedin\.com\/login\b/,
@@ -35,8 +35,31 @@ export function isCheckpoint(url, text = '') {
   return CHECKPOINT.some((re) => re.test(url)) || CHECKPOINT_TEXT.test(text.slice(0, 4000));
 }
 
-export function signedIn(url) {
-  return /linkedin\.com\/(feed|jobs|mynetwork|my-items|in\/)/.test(url) && !isCheckpoint(url);
+// Runs inside the page: what tells a signed-in LinkedIn page from a public one.
+// Public job pages load fine without an account, so the address proves nothing.
+export function signInSignalsInPage() {
+  const nav = [...document.querySelectorAll('header a, header button, nav a, nav button')]
+    .map((e) => (e.innerText || e.getAttribute('aria-label') || '').trim().toLowerCase().split('\n')[0])
+    .filter(Boolean)
+    .slice(0, 60);
+  const password = Boolean(document.querySelector('input[type="password"]'));
+  const loginForm = password && Boolean(document.querySelector('input[name="session_key"], input#username, input[autocomplete="username"], input[type="email"]'));
+  return { url: location.href, nav, password, loginForm };
+}
+
+export function signedInFrom(s) {
+  if (!s || isCheckpoint(s.url || '')) return false;
+  if (s.password || s.loginForm) return false;
+  if (/linkedin\.com\/(login|authwall|signup|uas\/)/.test(s.url || '')) return false;
+  const nav = s.nav || [];
+  if (nav.some((t) => /^(join now|sign in|sign up|join)$/.test(t))) return false;
+  // Only signed-in members get Messaging and Notifications in the top bar.
+  return nav.some((t) => /^(messaging|notifications)\b/.test(t));
+}
+
+export async function checkSignedIn(page) {
+  const s = await page.evaluate(signInSignalsInPage).catch(() => null);
+  return { signedIn: signedInFrom(s), loginShowing: Boolean(s?.loginForm || /linkedin\.com\/(login|uas\/)/.test(s?.url || '')), signals: s };
 }
 
 // f_TPR=r604800 = past week; f_WT 1 on-site, 2 remote, 3 hybrid. start = paging (25 per page).
@@ -58,7 +81,8 @@ export function viewUrl(jobId) {
 
 export function jobIdsFromHtml(html) {
   const ids = new Set();
-  for (const m of html.matchAll(/(?:\/jobs\/view\/|currentJobId=|data-job-id="|data-occludable-job-id="|urn:li:jobPosting:)(\d{6,})/g)) ids.add(m[1]);
+  const re = /(?:\/jobs\/view\/|currentJobId=|data-job-id="|data-occludable-job-id="|urn:li:(?:fs_|fsd_)?jobPosting:|"jobPostingId"\s*:\s*"?)(\d{6,})/g;
+  for (const m of html.matchAll(re)) ids.add(m[1]);
   return [...ids];
 }
 
@@ -103,11 +127,28 @@ export function endSitting(reason = 'ended', now = Date.now()) {
   return s;
 }
 
+// The client's sign-in was seen on a real signed-in page during this sitting.
+export function markSignedIn(clientId) {
+  const s = activeSitting();
+  if (!s || s.client !== clientId) return null;
+  s.signed_in_at = new Date().toISOString();
+  writeJson(sittingFile(), s);
+  return s;
+}
+
+export function markSignedOut(clientId) {
+  const s = activeSitting();
+  if (!s || s.client !== clientId) return;
+  delete s.signed_in_at;
+  writeJson(sittingFile(), s);
+}
+
 // null when LinkedIn work for this client may go ahead, else the reason it may not.
-export function sittingProblem(clientId) {
+export function sittingProblem(clientId, { needSignIn = true } = {}) {
   const s = activeSitting();
   if (!s) return `No sitting open. LinkedIn work only happens while ${clientId} is present: applydesk sitting start ${clientId} --present`;
   if (s.client !== clientId) return `The open sitting is for ${s.client}, not ${clientId}. End it first: applydesk sitting end`;
+  if (needSignIn && !s.signed_in_at) return `${clientId} has not signed in to LinkedIn yet in this sitting. They sign in in the LinkedIn window, then run: applydesk sitting start ${clientId} --present`;
   return null;
 }
 

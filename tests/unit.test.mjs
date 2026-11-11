@@ -12,7 +12,8 @@ const L = '../plugins/applydesk/skills/applydesk/scripts/lib';
 const LI = await import(`${L}/linkedin.mjs`);
 const { checkCv } = await import(`${L}/cvcheck.mjs`);
 const { planFill, answerSheet, SUBMIT_TEXT } = await import(`${L}/form.mjs`);
-const { addJob, getJob, listJobs } = await import(`${L}/jobs.mjs`);
+const { addJob, getJob, listJobs, mergeFetched, routeOf } = await import(`${L}/jobs.mjs`);
+const { parseJob, parseJobTitle, applyRoute, htmlToText } = await import(`${L}/lijob.mjs`);
 const { pactenRecord, appendCsv } = await import(`${L}/tracker.mjs`);
 const { toClient, formPage, missingInfo } = await import(`${L}/onboard.mjs`);
 const { findBrowser } = await import(`${L}/browser.mjs`);
@@ -101,6 +102,7 @@ test('sittings: one client at a time, required for LinkedIn work, expire', () =>
   assert.match(LI.sittingProblem('jane-doe'), /No sitting open/);
   const r = LI.startSitting('jane-doe', { operator: 'op', present: 'Jane Doe' });
   assert.equal(r.resumed, false);
+  LI.markSignedIn('jane-doe');
   assert.equal(LI.sittingProblem('jane-doe'), null);
   assert.match(LI.sittingProblem('bob'), /open sitting is for jane-doe/);
   assert.match(LI.startSitting('bob', { operator: 'op' }).error, /still open/);
@@ -209,4 +211,114 @@ test('ATS detection and Resume Worded score parsing', () => {
 
 test('data folder was the temp one, not the real home', () => {
   assert.ok(existsSync(join(process.env.APPLYDESK_HOME, 'clients', 'jane-doe', 'jobs')));
+});
+
+// ---- 0.3.0: LinkedIn pages read without LinkedIn's class names ----
+
+const DESC = 'Northwind Traders is hiring a Senior Data Analyst to lead reporting across Canada. You will build dashboards in Power BI, write SQL against our warehouse, and automate weekly reporting with Python. 5+ years in analytics.';
+const signedInSignals = {
+  url: 'https://www.linkedin.com/jobs/view/4100000001/',
+  doc_title: '(2) Senior Data Analyst | Northwind Traders | LinkedIn',
+  og_title: '',
+  h1: '',
+  company_link: 'Northwind Traders',
+  ld: [],
+  about: `About the job\n${DESC}\nAbout the company\nNorthwind sells food.`,
+  main: `Northwind Traders\nSenior Data Analyst\nToronto, ON · 3 days ago · Over 100 applicants\nHybrid\nApply\nSave\nAbout the job\n${DESC}\nAbout the company\nNorthwind sells food.\nMore jobs\nData Analyst\nContoso\nEasy Apply`,
+  controls: [{ text: 'Apply', aria: 'Apply to Senior Data Analyst on company website', href: 'https://www.linkedin.com/safety/go?url=https%3A%2F%2Fjobs.example%2F42' }],
+};
+
+test('LinkedIn job: tab title formats', () => {
+  assert.deepEqual(parseJobTitle('(2) Senior Data Analyst | Northwind Traders | LinkedIn'), { title: 'Senior Data Analyst', company: 'Northwind Traders', location: '' });
+  assert.deepEqual(parseJobTitle('Acme hiring Data Analyst in Vancouver, BC | LinkedIn'), { company: 'Acme', title: 'Data Analyst', location: 'Vancouver, BC' });
+  assert.deepEqual(parseJobTitle('LinkedIn'), { title: '', company: '', location: '' });
+});
+
+test('LinkedIn job: new signed-in layout reads title, company, location, description', () => {
+  const j = parseJob(signedInSignals, '4100000001');
+  assert.equal(j.title, 'Senior Data Analyst');
+  assert.equal(j.company, 'Northwind Traders');
+  assert.equal(j.location, 'Toronto, ON'); // not the company, not "3 days ago"
+  assert.match(j.description, /^Northwind Traders is hiring/);
+  assert.doesNotMatch(j.description, /About the company|Contoso/);
+  assert.equal(j.complete, true);
+  assert.ok(j.posted_at);
+});
+
+test('LinkedIn job: guest page uses the structured data', () => {
+  const ld = JSON.stringify({ '@type': 'JobPosting', title: 'Data Analyst', datePosted: '2026-11-08T10:00:00.000Z', hiringOrganization: { name: 'Acme' }, jobLocation: { address: { addressLocality: 'Vancouver', addressRegion: 'BC', addressCountry: 'CA' } }, description: `&lt;p&gt;${DESC}&lt;/p&gt;&lt;ul&gt;&lt;li&gt;SQL&lt;/li&gt;&lt;/ul&gt;` });
+  const j = parseJob({ doc_title: 'Acme hiring Data Analyst in Vancouver, BC | LinkedIn', ld: [ld], main: '', about: '', controls: [] }, '7');
+  assert.equal(j.title, 'Data Analyst');
+  assert.equal(j.company, 'Acme');
+  assert.equal(j.location, 'Vancouver, BC, CA');
+  assert.match(j.description, /Northwind Traders is hiring[\s\S]*- SQL/);
+  assert.doesNotMatch(j.description, /<p>|&lt;/);
+  assert.equal(j.posted_exact, true);
+});
+
+test('LinkedIn job: a page that could not be read is incomplete, never blank-but-ready', () => {
+  const j = parseJob({ doc_title: 'LinkedIn', ld: [], main: 'Sign in to see who you already know', about: '', controls: [] }, '9');
+  assert.equal(j.complete, false);
+  assert.deepEqual(j.missing, ['title', 'company', 'description']);
+});
+
+test('LinkedIn job: apply route comes from the real apply button, else unknown', () => {
+  assert.equal(applyRoute([{ text: 'Easy Apply', aria: 'Easy Apply to Data Analyst', href: '' }]).route, 'easy_apply');
+  const ext = applyRoute(signedInSignals.controls);
+  assert.equal(ext.route, 'employer_site');
+  assert.equal(applyRoute([], '"companyApplyUrl":"https:\\u002F\\u002Fjobs.acme.example\\u002F1"').apply_url, 'https://jobs.acme.example/1');
+  assert.equal(applyRoute([]).route, 'unknown');
+  assert.equal(applyRoute([{ text: 'Easy Apply', aria: '', href: '' }], '"companyApplyUrl":"https://x.example/a"').route, 'unknown');
+  // A similar-job card that says "Easy Apply" is not this job's button.
+  assert.equal(parseJob(signedInSignals, '1').route, 'employer_site');
+});
+
+test('html descriptions become plain text', () => {
+  assert.equal(htmlToText('<p>A &amp; B</p><ul><li>one</li></ul>'), 'A & B\n\n- one');
+});
+
+test('jobs that could not be read are saved as incomplete with a readable folder', () => {
+  const r = addJob('jane-doe', { source: 'linkedin', external_id: '555', url: 'https://www.linkedin.com/jobs/view/555/', title: '', company: '', description: '' });
+  const m = getJob('jane-doe', r.jobId);
+  assert.equal(m.status, 'incomplete');
+  assert.match(r.jobId, /linkedin-555$/);
+  assert.doesNotMatch(r.jobId, /x-x/);
+  assert.equal(routeOf(m), 'unknown');
+});
+
+test('job fetch fills blank, pending or fallback fields but keeps real ones', () => {
+  const meta = { title: '', company: 'pending', location: '', easy_apply: null, status: 'incomplete' };
+  const got = { title: 'Data Analyst', company: 'Acme', location: 'Toronto', route: 'employer_site', easy_apply: false, apply_url: 'https://a.example', complete: true, description: 'x'.repeat(300) };
+  const p = mergeFetched(meta, got);
+  assert.equal(p.title, 'Data Analyst');
+  assert.equal(p.company, 'Acme');
+  assert.equal(p.status, 'jd_ready');
+  assert.equal(p.easy_apply, false);
+  const kept = mergeFetched({ title: 'Edited by hand', company: 'Acme Corp', location: 'Remote', apply_url: 'https://a.example', easy_apply: true, status: 'cv_ready' }, { ...got, route: 'unknown', easy_apply: null });
+  assert.deepEqual(kept, {}); // hand edits, a known route and later statuses all stay
+});
+
+test('LinkedIn job ids in the new search layout', () => {
+  const ids = LI.jobIdsFromHtml('{"entityUrn":"urn:li:fsd_jobPosting:4100000001"} href="/jobs/search-results/?currentJobId=4100000002" "jobPostingId":4100000003');
+  assert.deepEqual(ids.sort(), ['4100000001', '4100000002', '4100000003']);
+  assert.ok(LI.allowed('https://www.linkedin.com/jobs/search-results/?keywords=analyst&infoNotice=ai-job-search'));
+});
+
+test('signed in means LinkedIn signed-in navigation, not just the address', () => {
+  const base = { url: 'https://www.linkedin.com/jobs/', loginForm: false, password: false, nav: [] };
+  assert.equal(LI.signedInFrom({ ...base, nav: ['join now', 'sign in'] }), false); // public jobs page
+  assert.equal(LI.signedInFrom({ ...base, nav: ['home', 'my network', 'jobs', 'messaging', 'notifications', 'me'] }), true);
+  assert.equal(LI.signedInFrom({ ...base, url: 'https://www.linkedin.com/login', loginForm: true, password: true }), false);
+  assert.equal(LI.signedInFrom({ ...base, nav: ['messaging'], password: true }), false);
+  assert.equal(LI.signedInFrom({ ...base, url: 'https://www.linkedin.com/checkpoint/challenge/x', nav: ['messaging'] }), false);
+});
+
+test('LinkedIn work needs a confirmed sign-in, not only an open sitting', () => {
+  LI.endSitting('test');
+  LI.startSitting('sam', { operator: 'op', present: 'Sam' });
+  assert.match(LI.sittingProblem('sam'), /sign/i);
+  assert.equal(LI.sittingProblem('sam', { needSignIn: false }), null);
+  LI.markSignedIn('sam');
+  assert.equal(LI.sittingProblem('sam'), null);
+  LI.endSitting('test');
 });

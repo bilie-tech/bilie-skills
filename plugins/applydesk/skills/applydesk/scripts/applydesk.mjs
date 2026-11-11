@@ -13,7 +13,8 @@ import { ok, fail, blocked, say } from './lib/out.mjs';
 import { doctor } from './lib/doctor.mjs';
 import { withProfile, closeProfile, listOpen, pickPage } from './lib/browser.mjs';
 import * as LI from './lib/linkedin.mjs';
-import { addJob, getJob, updateJob, listJobs, readJd, latestCv, freshness } from './lib/jobs.mjs';
+import { addJob, getJob, updateJob, listJobs, readJd, latestCv, freshness, mergeFetched, routeOf } from './lib/jobs.mjs';
+import { jobSignalsInPage, parseJob } from './lib/lijob.mjs';
 import { fetchBoard, matches, detectAts, ATS_NOTES } from './lib/ats.mjs';
 import { checkCv, jdKeywords } from './lib/cvcheck.mjs';
 import { scan as scanForm, planFill, setField, answerSheet, SUBMIT_TEXT, ATTEST } from './lib/form.mjs';
@@ -58,27 +59,52 @@ const clientIds = () => {
   return existsSync(dir) ? readdirSync(dir).filter((d) => existsSync(paths.clientFile(d))) : [];
 };
 
-const isEasy = (j) => Boolean(j.easy_apply);
+const isEasy = (j) => j.easy_apply === true;
+
+// The operator's local clock, for anything a person reads.
+const local = (iso) => new Date(iso).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
 
 async function pageText(page, max = 4000) {
   return (await page.evaluate(() => document.body?.innerText || '').catch(() => '')).slice(0, max);
 }
 
 // Open a LinkedIn page for the client in the open sitting. Returns null, or a stop.
-async function liGoto(page, client, url) {
+// Never navigates away from a sign-in form the client may be typing into, and
+// stops (blocked) the moment a page shows LinkedIn signed out.
+async function liGoto(page, client, url, { timeout = 30000 } = {}) {
   const why = LI.sittingProblem(client.id);
   if (why) return { stop: 'blocked', reason: why };
   if (!LI.allowed(url)) return { stop: 'fail', reason: `ApplyDesk only opens LinkedIn job pages, not: ${url}` };
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
+  if (/linkedin\.com/.test(page.url()) && (await LI.checkSignedIn(page)).loginShowing) return signedOutStop(page, client);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+  await page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
   const text = await pageText(page);
   if (LI.isCheckpoint(page.url(), text)) {
     LI.stopForCheck(client.id, page.url());
     await page.bringToFront().catch(() => {});
     return { stop: 'blocked', reason: `LinkedIn showed a security check or warning for ${client.id}. ApplyDesk stopped and ended the sitting. The client deals with it in the open window; do not retry it with ApplyDesk today.` };
   }
+  if (!(await LI.checkSignedIn(page)).signedIn) return signedOutStop(page, client);
   LI.audit(client.id, 'open', page.url());
   return null;
+}
+
+async function signedOutStop(page, client) {
+  LI.markSignedOut(client.id);
+  await page.bringToFront().catch(() => {});
+  return { stop: 'blocked', reason: `LinkedIn is not signed in for ${client.id}. ${client.full_name}: sign in in the LinkedIn window, then run: applydesk sitting start ${client.id} --present` };
+}
+
+// One retry for a page that times out or aborts; a security check or sign-out is never retried.
+async function liGotoRetry(page, client, url) {
+  for (let i = 0; ; i++) {
+    try {
+      return await liGoto(page, client, url);
+    } catch (e) {
+      if (i >= 1) return { stop: 'skip', reason: e.message.split('\n')[0] };
+      await page.waitForTimeout(2000);
+    }
+  }
 }
 
 const stopped = (step, stop, data) => (stop.stop === 'blocked' ? blocked : fail)(step, stop.reason, data);
@@ -93,11 +119,12 @@ const commands = {
         'doctor [--fix]',
         'setup --operator <name> [--pacten-url <url>] [--rw-cap <n>] | setup --signin resume-worded|pacten | setup --check',
         'client new | client edit <id> | client list | client show <id>',
-        'sitting start <client> --present     the client is here; they sign in to LinkedIn themselves',
-        'sitting status | sitting end | sitting forget <client>',
-        'discover linkedin <client> [--max <n>] [--pages <n>]   (in a sitting)',
+        'sitting start <client> --present [--wait <seconds>]   the client is here; they sign in to LinkedIn themselves',
+        'sitting status | sitting end | sitting forget <client> | sitting read <client> [--job <job>] [--max <chars>]   (read-only, for diagnosis)',
+        'discover linkedin <client> [--max <n>] [--pages <n>] [--minutes <n>]   (in a sitting)',
         'discover ats <client> [--board greenhouse:<token> ...] | discover links <client> <url> [...]',
-        'jobs <client> [--status <s>] [--easy|--employer] | job show|fetch <client> <job> | job jd <client> <job> <file> | job set <client> <job> [--status s] [--note "..."]',
+        'jobs <client> [--status <s>] [--easy|--employer|--unknown] | job show|fetch <client> <job> | job jd <client> <job> <file> [--title t] [--company c]',
+        'job set <client> <job> [--title t] [--company c] [--location l] [--apply-url u] [--route easy|employer|unknown] [--status s] [--note "..."]',
         'cv brief <client> <job> | cv check <client> <job|master> | cv render <client> <job|master>',
         'rw budget | rw scan <client> <job|master> [--targeted] | rw record <client> <job|master> <score> [--targeted]',
         'apply start <client> <job> | apply ready <client> <job> | apply done <client> <job>   (employer sites)',
@@ -182,13 +209,15 @@ const commands = {
         clients: clientIds().map((cid) => {
           const jobs = listJobs(cid);
           const easy = jobs.filter(isEasy);
-          const employer = jobs.filter((j) => !isEasy(j));
+          const employer = jobs.filter((j) => j.easy_apply === false);
           const by = (list, s) => list.filter((j) => j.status === s).length;
           return {
             id: cid,
             found: jobs.length,
             employer: { cv_ready: by(employer, 'cv_ready'), ready_for_review: by(employer, 'ready_for_review'), applied: by(employer, 'applied') },
             easy_apply: { waiting_for_sitting: easy.filter((j) => j.status === 'cv_ready').length, applied: by(easy, 'applied') },
+            route_unknown: jobs.filter((j) => routeOf(j) === 'unknown').length,
+            incomplete: jobs.filter((j) => j.status === 'incomplete').length,
             linkedin_hold: Boolean(LI.lastHold(cid)),
           };
         }),
@@ -205,7 +234,11 @@ const commands = {
 
   async sitting({ pos, flags }) {
     const [sub, id] = pos;
-    if (sub === 'status') return ok('sitting', { open: LI.activeSitting(), max_hours: LI.SITTING_HOURS });
+    if (sub === 'status') {
+      const open = LI.activeSitting();
+      const ends = open ? new Date(Date.parse(open.started_at) + LI.SITTING_HOURS * 3600e3).toISOString() : null;
+      return ok('sitting', { open, signed_in: Boolean(open?.signed_in_at), ends_by: ends, ends_by_local: ends && local(ends), max_hours: LI.SITTING_HOURS });
+    }
     if (sub === 'end') {
       const s = LI.endSitting(flags.reason || 'ended by operator');
       if (s) await closeProfile(linkedinProfileName(s.client)).catch(() => {});
@@ -218,7 +251,8 @@ const commands = {
       rmSync(paths.profile(linkedinProfileName(client.id)), { recursive: true, force: true });
       return ok('sitting', { forgotten: client.id, next: 'The saved LinkedIn sign-in on this machine is deleted. The client can also use LinkedIn > Settings > Sign out of all sessions.' });
     }
-    if (sub !== 'start') return fail('sitting', 'Use: sitting start <client> --present | status | end | forget <client>');
+    if (sub === 'read') return sittingRead(loadClient(id), flags);
+    if (sub !== 'start') return fail('sitting', 'Use: sitting start <client> --present | status | end | forget <client> | read <client>');
 
     const client = loadClient(id);
     if (!flags.present) return blocked('sitting', `Only start a sitting when ${client.full_name} is here (in person or on a screen share). Then repeat with --present.`);
@@ -229,37 +263,49 @@ const commands = {
     const r = LI.startSitting(client.id, { operator: op.id, present: client.full_name });
     if (r.error) return blocked('sitting', r.error);
     const hold = LI.lastHold(client.id);
+    // Short by default so the command returns before an agent's tool timeout; run it again to re-check.
+    const waitMs = Math.max(0, Math.min(540, Number(flags.wait ?? 90))) * 1000;
 
-    let state = 'signed out';
-    await withProfile(linkedinProfileName(client.id), async (ctx) => {
+    const state = await withProfile(linkedinProfileName(client.id), async (ctx) => {
       const page = await pickPage(ctx, 'linkedin.com');
-      await page.goto('https://www.linkedin.com/jobs/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.bringToFront();
-      if (LI.signedIn(page.url())) {
-        state = 'signed in';
-        return;
-      }
-      if (!/linkedin\.com\/login/.test(page.url())) await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
-      say(`${client.full_name}: please sign in to LinkedIn yourself in the window that just opened (and approve any 2-step check). Waiting up to 10 minutes...`);
-      const until = Date.now() + 10 * 60e3;
-      while (Date.now() < until) {
-        await page.waitForTimeout(3000);
-        if (LI.signedIn(page.url())) {
-          state = 'signed in now';
-          return;
+      await page.bringToFront().catch(() => {});
+      let seen = /linkedin\.com/.test(page.url()) ? await LI.checkSignedIn(page) : null;
+      // Never reload over a sign-in form the client may be typing into.
+      if (!seen?.signedIn && !seen?.loginShowing) {
+        await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+        if (LI.isCheckpoint(page.url(), await pageText(page))) return 'check';
+        seen = await LI.checkSignedIn(page);
+        if (!seen.signedIn && !seen.loginShowing) {
+          await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+          seen = await LI.checkSignedIn(page);
         }
       }
+      if (seen.signedIn) return 'signed in';
+      say(`${client.full_name}: please sign in to LinkedIn yourself in the window that just opened (and approve any 2-step check).`);
+      const until = Date.now() + waitMs;
+      while (Date.now() < until) {
+        await page.waitForTimeout(3000);
+        if (LI.isCheckpoint(page.url(), '')) continue; // a 2-step check is the client's to finish
+        if ((await LI.checkSignedIn(page)).signedIn) return 'signed in now';
+      }
+      return 'signed out';
     });
-    if (state === 'signed out') {
-      LI.endSitting('client did not sign in');
-      return blocked('sitting', 'The client did not finish signing in within 10 minutes. Start the sitting again when they are ready.');
+    if (state === 'check') {
+      LI.stopForCheck(client.id, 'https://www.linkedin.com/feed/');
+      return blocked('sitting', `LinkedIn showed a security check for ${client.id}. The client deals with it in the open window; do not retry with ApplyDesk today.`);
     }
+    if (state === 'signed out') {
+      return blocked('sitting', `${client.full_name}: sign in to LinkedIn now, in the window that is open (approve any 2-step check). ApplyDesk will not load any LinkedIn page until you have. When the feed or jobs page shows, run: applydesk sitting start ${client.id} --present`, { client: client.id, state: 'waiting for sign-in' });
+    }
+    LI.markSignedIn(client.id);
     if (hold) LI.clearHold(client.id);
-    LI.audit(client.id, 'sitting', 'https://www.linkedin.com/jobs/', { state, operator: op.id });
+    LI.audit(client.id, 'sitting', 'https://www.linkedin.com/feed/', { state, operator: op.id });
     const waiting = listJobs(client.id, 'cv_ready').filter(isEasy).length;
+    const ends = new Date(Date.parse(r.sitting.started_at) + LI.SITTING_HOURS * 3600e3).toISOString();
     return ok('sitting', {
-      client: client.id, state, resumed: r.resumed, ends_by: new Date(Date.parse(r.sitting.started_at) + LI.SITTING_HOURS * 3600e3).toISOString(),
-      previous_check: hold ? `Last sitting stopped on a LinkedIn check at ${hold.at}. Ask the client if their account is fine before searching.` : undefined,
+      client: client.id, state, resumed: r.resumed, ends_by: ends, ends_by_local: local(ends),
+      previous_check: hold ? `Last sitting stopped on a LinkedIn check at ${local(hold.at)}. Ask the client if their account is fine before searching.` : undefined,
       next: [`applydesk discover linkedin ${client.id}`, waiting ? `applydesk easy next ${client.id}   (${waiting} Easy Apply jobs have CVs ready)` : null, 'applydesk sitting end   (when the client leaves)'].filter(Boolean),
     });
   },
@@ -287,7 +333,7 @@ const commands = {
       let added = 0;
       for (const url of rest) {
         const li = url.match(/linkedin\.com\/jobs\/view\/(\d+)/);
-        const r = addJob(client.id, { source: li ? 'linkedin' : 'link', external_id: li?.[1] || url, url, title: 'pending', company: 'pending' });
+        const r = addJob(client.id, { source: li ? 'linkedin' : 'link', external_id: li?.[1] || url, url, title: '', company: '' });
         if (r.created) added++;
       }
       return ok('discover', { source: 'links', added, next: `applydesk job fetch ${client.id} <job> for each new job (LinkedIn links: in a sitting)` });
@@ -297,16 +343,28 @@ const commands = {
     if (!client.target_titles?.length) return blocked('discover', `No target job titles for ${client.id} yet. Add them: applydesk client edit ${client.id}`);
     const why = LI.sittingProblem(client.id);
     if (why) return blocked('discover', why);
-    const max = Number(flags.max || 25);
+    const max = Math.max(1, Number(flags.max || 10));
     const pages = Math.max(1, Math.min(4, Number(flags.pages || 1)));
-    const summary = { searched: 0, read: 0, added: 0, easy_apply: 0, employer_site: 0, skipped: 0 };
+    // Stop in time to report: agents' shell tools time out at about 10 minutes.
+    const until = Date.now() + Math.max(1, Math.min(9, Number(flags.minutes || 7))) * 60e3;
+    const summary = { searched: 0, read: 0, added: 0, easy_apply: 0, employer_site: 0, route_unknown: 0, incomplete: 0, skipped: 0, failed: 0 };
+    const problems = [];
+    const done = (extra = {}) => ok('discover', {
+      source: 'linkedin', ...summary, ...extra, problems: problems.slice(0, 8),
+      next: summary.incomplete ? 'Incomplete jobs: job fetch <client> <job> in a sitting, or job set --title/--company plus job jd. Then cv brief / check / render / rw scan.' : 'For each new job: cv brief / cv check / cv render / rw scan. Employer-site jobs need no sitting; Easy Apply jobs wait for: easy next',
+    });
     return withProfile(linkedinProfileName(client.id), async (ctx) => {
       const page = await pickPage(ctx, 'linkedin.com');
       const ids = [];
-      for (const title of client.target_titles || []) {
-        for (let p = 0; p < pages; p++) {
+      for (const title of client.target_titles) {
+        for (let p = 0; p < pages && Date.now() < until; p++) {
           const url = LI.searchUrl({ keywords: title, location: client.locations?.[0] || client.country, remote: client.remote, days: Math.min(14, client.max_age_days || 14), start: p * 25 });
-          const stop = await liGoto(page, client, url);
+          const stop = await liGotoRetry(page, client, url);
+          if (stop?.stop === 'skip') {
+            summary.failed++;
+            problems.push(`search "${title}" page ${p + 1}: ${stop.reason}`);
+            continue;
+          }
           if (stop) return stopped('discover', stop, summary);
           summary.searched++;
           // The results list loads as it scrolls into view.
@@ -319,30 +377,41 @@ const commands = {
       }
       const index = readJson(join(paths.jobs(client.id), 'index.json'), {});
       const fresh = [...new Set(ids)].filter((jid) => !index[`linkedin:${jid}`]);
-      for (const jid of fresh.slice(0, max)) {
-        const stop = await liGoto(page, client, LI.viewUrl(jid));
+      let looked = 0;
+      for (const jid of fresh) {
+        if (looked >= max || Date.now() > until) break;
+        looked++;
+        const stop = await liGotoRetry(page, client, LI.viewUrl(jid));
+        if (stop?.stop === 'skip') {
+          summary.failed++;
+          problems.push(`job ${jid}: ${stop.reason}`);
+          continue;
+        }
         if (stop) return stopped('discover', stop, summary);
         summary.read++;
         const job = await extractLinkedinJob(page, jid);
         const title = (job.title || '').toLowerCase();
-        if ((client.excluded_keywords || []).some((k) => title.includes(k.toLowerCase())) || (client.excluded_employers || []).some((e) => job.company?.toLowerCase().includes(e.toLowerCase()))) {
+        if (job.closed || (client.excluded_keywords || []).some((k) => title.includes(k.toLowerCase())) || (client.excluded_employers || []).some((e) => job.company?.toLowerCase().includes(e.toLowerCase()))) {
           summary.skipped++;
           continue;
         }
+        // Saved as it goes, so a later failure loses nothing. Unreadable pages are kept as "incomplete".
         if (addJob(client.id, job).created) {
           summary.added++;
-          summary[job.easy_apply ? 'easy_apply' : 'employer_site']++;
+          if (!job.complete) summary.incomplete++;
+          summary[{ easy_apply: 'easy_apply', employer_site: 'employer_site' }[job.route] || 'route_unknown']++;
         }
       }
-      return ok('discover', { source: 'linkedin', ...summary, more_available: fresh.length > max, next: 'For each new job: cv brief / cv check / cv render / rw scan. Employer-site jobs need no sitting; Easy Apply jobs wait for: easy next' });
+      return done({ more_available: fresh.length > looked });
     });
   },
 
   async jobs({ pos, flags }) {
     let list = listJobs(pos[0], flags.status);
     if (flags.easy) list = list.filter(isEasy);
-    if (flags.employer) list = list.filter((j) => !isEasy(j));
-    const jobs = list.map((j) => ({ job: j.job_id, title: j.title, company: j.company, status: j.status, route: isEasy(j) ? 'easy_apply' : 'employer_site', age: j.age_days_when_found, ats: j.ats, rw: j.resume_worded_score, check: j.local_check_score }));
+    if (flags.employer) list = list.filter((j) => j.easy_apply === false);
+    if (flags.unknown) list = list.filter((j) => routeOf(j) === 'unknown');
+    const jobs = list.map((j) => ({ job: j.job_id, title: j.title, company: j.company, status: j.status, route: routeOf(j), age: j.age_days_when_found, ats: j.ats, rw: j.resume_worded_score, check: j.local_check_score }));
     return ok('jobs', { count: jobs.length, jobs: jobs.slice(0, Number(flags.limit || 50)) });
   },
 
@@ -350,17 +419,30 @@ const commands = {
     const [sub, id, jobId, file] = pos;
     const client = loadClient(id);
     if (sub === 'show') return ok('job', { meta: getJob(client.id, jobId), jd_chars: readJd(client.id, jobId).length });
-    if (sub === 'set') {
-      const patch = {};
-      if (flags.status) patch.status = flags.status;
-      return ok('job', { meta: updateJob(client.id, jobId, patch, flags.note) });
-    }
-    if (sub === 'jd') {
-      if (!file || !existsSync(file)) return fail('job', 'Give a text file with the job description: job jd <client> <job> <file>');
+    if (sub === 'set' || sub === 'jd') {
       const meta = getJob(client.id, jobId);
-      writeFileSync(join(paths.job(client.id, jobId), 'jd.md'), `# ${meta.title} — ${meta.company}\n\n${readFileSync(file, 'utf8')}\n`);
-      updateJob(client.id, jobId, { status: 'jd_ready' }, 'description added by hand');
-      return ok('job', { job: jobId, status: 'jd_ready' });
+      const patch = {};
+      for (const k of ['title', 'company', 'location']) if (typeof flags[k] === 'string') patch[k] = flags[k].trim();
+      if (typeof flags['apply-url'] === 'string') patch.apply_url = flags['apply-url'].trim();
+      if (flags.route) {
+        const route = { easy: true, easy_apply: true, employer: false, employer_site: false, unknown: null }[flags.route];
+        if (route === undefined) return fail('job', 'Use --route easy|employer|unknown');
+        patch.easy_apply = route;
+      }
+      if (flags.status) patch.status = flags.status;
+      const jdFile = join(paths.job(client.id, jobId), 'jd.md');
+      if (sub === 'jd') {
+        if (!file || !existsSync(file)) return fail('job', 'Give a text file with the job description: job jd <client> <job> <file> [--title t] [--company c]');
+        const body = readFileSync(file, 'utf8').trim();
+        if (body.length < 200) return fail('job', 'That description is under 200 characters. Paste the whole "About the job" text into the file.');
+        writeFileSync(jdFile, `# ${patch.title || meta.title} — ${patch.company || meta.company}\n\n${body}\n`);
+      }
+      const next = { ...meta, ...patch };
+      const named = next.title?.trim() && next.company?.trim();
+      // A job becomes ready for CV work once it has a title, a company and a description.
+      if (!flags.status && ['incomplete', 'found'].includes(meta.status)) patch.status = named && existsSync(jdFile) ? 'jd_ready' : 'incomplete';
+      const m = updateJob(client.id, jobId, patch, flags.note || (sub === 'jd' ? 'description added by hand' : Object.keys(patch).length ? `set by hand: ${Object.keys(patch).join(', ')}` : undefined));
+      return ok('job', { job: jobId, title: m.title, company: m.company, location: m.location, route: routeOf(m), status: m.status });
     }
     if (sub === 'fetch') {
       const meta = getJob(client.id, jobId);
@@ -380,22 +462,24 @@ const commands = {
           await page.goto(meta.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
           await page.waitForTimeout(2000);
           const text = await mainText(page);
-          job = { title: (await page.title()).split(/[|\-–]/)[0].trim(), description: text, apply_url: meta.url };
+          job = { title: (await page.title()).split(/[|\-–]/)[0].trim(), description: text, apply_url: meta.url, easy_apply: false };
         }
-        if (!job.description || job.description.length < 200) return fail('job', 'Could not read the job description from the page. Use: page read, or job jd', { url: page.url() });
-        writeFileSync(join(paths.job(client.id, jobId), 'jd.md'), `# ${job.title || meta.title} — ${job.company || meta.company}\n\n${job.description}\n`);
+        const patch = mergeFetched(meta, job);
+        if (job.description?.length >= 200) {
+          writeFileSync(join(paths.job(client.id, jobId), 'jd.md'), `# ${patch.title || meta.title} — ${patch.company || meta.company}\n\n${job.description}\n`);
+        }
         const fr = freshness(job.posted_at);
         const m = updateJob(client.id, jobId, {
-          title: meta.title === 'pending' ? job.title || meta.title : meta.title,
-          company: meta.company === 'pending' ? job.company || meta.company : meta.company,
-          apply_url: job.apply_url || meta.apply_url,
-          easy_apply: Boolean(job.easy_apply),
-          ats: detectAts(job.apply_url || meta.apply_url),
-          ...(job.posted_at ? { posted_at: job.posted_at, age_days_when_found: fr.age_days, freshness_priority: fr.priority } : {}),
-          status: 'jd_ready',
+          ...patch,
+          ats: detectAts(patch.apply_url || meta.apply_url),
+          ...(job.posted_at && !meta.posted_at ? { posted_at: job.posted_at, age_days_when_found: fr.age_days, freshness_priority: fr.priority } : {}),
         });
         if (!isLi) await page.close().catch(() => {});
-        return ok('job', { job: jobId, title: m.title, company: m.company, route: m.easy_apply ? 'easy_apply' : 'employer_site', ats: m.ats, jd_chars: job.description.length });
+        const missing = [!m.title && 'title', !m.company && 'company', !(job.description?.length >= 200) && 'description'].filter(Boolean);
+        if (missing.length) {
+          return fail('job', `Could not read the ${missing.join(', ')} from the page. Look with: applydesk sitting read ${client.id} --job ${jobId}. Or set it by hand: job set ${client.id} ${jobId} --title "..." --company "...", and job jd ${client.id} ${jobId} <file>`, { url: page.url(), missing, status: m.status });
+        }
+        return ok('job', { job: jobId, title: m.title, company: m.company, route: routeOf(m), ats: m.ats, status: m.status, jd_chars: job.description.length });
       });
     }
     return fail('job', 'Use: job show|fetch|jd|set <client> <job>');
@@ -409,6 +493,7 @@ const commands = {
     const isMaster = target === 'master';
     const dir = isMaster ? join(paths.client(id), 'cv') : paths.job(id, target);
     if (sub === 'brief') {
+      if (getJob(id, target).status === 'incomplete') return blocked('cv', `This job's details are incomplete. Run: applydesk job fetch ${id} ${target} (in a sitting), or job set ${id} ${target} --title "..." --company "..." and job jd ${id} ${target} <file>`);
       const jd = readJd(id, target);
       if (!jd) return blocked('cv', `No job description yet. Run: applydesk job fetch ${id} ${target}`);
       const cv = latestCv(id, target);
@@ -744,34 +829,43 @@ async function fillPage(page, client, ctx) {
 }
 
 async function extractLinkedinJob(page, jid) {
-  const d = await page.evaluate(() => {
-    const q = (sels) => sels.map((s) => document.querySelector(s)).find(Boolean);
-    const title = q(['h1', '.job-details-jobs-unified-top-card__job-title', '.top-card-layout__title'])?.innerText?.trim();
-    const company = q(['.job-details-jobs-unified-top-card__company-name a', '.job-details-jobs-unified-top-card__company-name', 'a[href*="/company/"]'])?.innerText?.trim();
-    const top = q(['.job-details-jobs-unified-top-card__primary-description-container', '.job-details-jobs-unified-top-card__tertiary-description-container', '.jobs-unified-top-card', 'main'])?.innerText || '';
-    const desc = q(['#job-details', '.jobs-description__content', '.jobs-description-content__text', '.jobs-box__html-content', '[class*="jobs-description"]'])?.innerText?.trim();
-    const easy = [...document.querySelectorAll('button, a')].some((b) => /easy apply/i.test(b.innerText || ''));
-    return { title, company, top: top.slice(0, 600), desc, easy };
+  // The description and apply button can render a moment after the page loads.
+  let job;
+  for (let i = 0; i < 3; i++) {
+    const sig = await page.evaluate(jobSignalsInPage);
+    job = parseJob(sig, jid, await page.content());
+    if (job.complete && job.route !== 'unknown') break;
+    await page.waitForTimeout(1500);
+  }
+  return job;
+}
+
+// Read-only look at the client's LinkedIn window, for working out what went wrong.
+// Clicks nothing; navigates only to one of the client's saved LinkedIn jobs.
+async function sittingRead(client, flags) {
+  const why = LI.sittingProblem(client.id, { needSignIn: false });
+  if (why) return blocked('sitting', why);
+  return withProfile(linkedinProfileName(client.id), async (ctx) => {
+    const page = await pickPage(ctx, 'linkedin.com');
+    if (flags.job) {
+      const meta = getJob(client.id, String(flags.job));
+      if (!/linkedin\.com\/jobs\/view/.test(meta.url)) return fail('sitting', 'That job is not a LinkedIn job');
+      const stop = await liGoto(page, client, meta.url);
+      if (stop) return stopped('sitting', stop);
+    }
+    const url = page.url();
+    if (!/linkedin\.com/.test(url)) return ok('sitting', { url, note: 'The LinkedIn window is not on a LinkedIn page.' });
+    if (!LI.allowed(url) && !LI.isCheckpoint(url)) return fail('sitting', `sitting read only reads LinkedIn job and sign-in pages, not: ${url}`);
+    const sign = await LI.checkSignedIn(page);
+    const out = { url, title: await page.title(), signed_in: sign.signedIn, sign_in_form_showing: sign.loginShowing };
+    const m = url.match(/\/jobs\/view\/(\d+)/) || url.match(/currentJobId=(\d+)/);
+    if (m) {
+      const j = parseJob(await page.evaluate(jobSignalsInPage), m[1], await page.content());
+      out.job = { title: j.title, company: j.company, location: j.location, route: j.route, apply_url: j.apply_url || undefined, description_chars: j.description.length, missing: j.missing };
+    }
+    out.text = await mainText(page, Number(flags.max || 3000));
+    return ok('sitting', out);
   });
-  const html = await page.content();
-  const applyMatch = html.match(/"companyApplyUrl":"(https?:[^"]+)"/) || html.match(/externalApply[^"]*?url=([^&"]+)/);
-  let applyUrl = applyMatch ? applyMatch[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&') : null;
-  if (applyUrl && /^https?%3A/i.test(applyUrl)) applyUrl = decodeURIComponent(applyUrl);
-  const age = LI.ageDays(d.top);
-  const location = (d.top.split(/·|\n/)[0] || '').trim();
-  return {
-    source: 'linkedin',
-    external_id: jid,
-    title: d.title || '',
-    company: d.company || '',
-    location,
-    url: LI.viewUrl(jid),
-    apply_url: d.easy && !applyUrl ? '' : applyUrl || '',
-    easy_apply: d.easy && !applyUrl,
-    posted_at: age === null ? null : new Date(Date.now() - age * 864e5).toISOString(),
-    posted_exact: false,
-    description: d.desc || '',
-  };
 }
 
 // ---------- main ----------

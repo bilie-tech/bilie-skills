@@ -31,9 +31,11 @@ In Claude, say: **"Set up ApplyDesk on this machine. My name is <your name>."**
 ## 3. Onboard a test client (5 min)
 
 Say: **"Onboard a new client."**
-- A form opens in the browser. Fill it in, upload the .docx CV, tick the consents,
-  and click Save.
-- Check: it says the client was saved and the master CV was read.
+- A form opens in the browser, and Claude also gives you its address. Fill in a
+  few fields, close the tab, then say "open the form again": what you typed should
+  come back. Upload the CV (.docx or PDF), tick the consents, and click Save.
+- Check: say "is it saved?". Claude lists what is still missing.
+- Try "set Jane's city to San Diego": one field changes without the form.
 
 ## 4. Sitting and LinkedIn search (10 min, client present)
 

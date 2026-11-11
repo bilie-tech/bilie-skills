@@ -11,7 +11,10 @@ in the room, or on a screen share of the ApplyDesk computer.
 - `sitting start <client> --present` opens that client's LinkedIn browser window.
   Only start it once the client is actually there.
 - The first time, the client types their own email and password and approves any
-  2-step check. ApplyDesk waits; it never sees or stores the password.
+  2-step check. ApplyDesk does not load any LinkedIn page while the sign-in form is
+  showing, and counts the client as signed in only when LinkedIn's signed-in
+  navigation (Messaging, Notifications) appears. It never sees or stores the
+  password.
 - The window keeps them signed in on this computer, so later sittings usually
   start signed in, with no prompts.
 - Only one sitting is open on a computer at a time. `sitting end` closes the
@@ -21,7 +24,10 @@ in the room, or on a screen share of the ApplyDesk computer.
 ## What ApplyDesk does in a sitting
 
 - Runs the client's saved job searches (`discover linkedin`) and reads the job
-  pages it finds.
+  pages it finds. Pages are read from what survives redesigns (the tab title, the
+  job's structured data, the "About the job" section), not LinkedIn's class names.
+- `sitting read` looks at the open LinkedIn window without clicking anything, to
+  work out why a page was not read.
 - Saves each job's description and its route: Easy Apply, or the employer link.
 - Opens Easy Apply jobs one at a time (`easy next`). The client clicks Easy Apply,
   attaches the CV, checks the answers and submits.

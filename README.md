@@ -25,7 +25,8 @@ irm https://raw.githubusercontent.com/bilie-tech/bilie-skills/main/scripts/boots
 curl -fsSL https://raw.githubusercontent.com/bilie-tech/bilie-skills/main/scripts/bootstrap.sh | bash
 ```
 
-**Already have Claude Code:**
+**Already have Claude Code:** ApplyDesk also needs Node.js 20 or newer. Check with
+`node --version`; on Windows install it with `winget install OpenJS.NodeJS.LTS`.
 
 ```
 claude plugin marketplace add bilie-tech/bilie-skills
@@ -33,6 +34,11 @@ claude plugin install applydesk@bilie-skills
 ```
 
 Then start `claude` and say "set up ApplyDesk on this machine".
+
+**Updating:** `claude plugin marketplace update bilie-skills`, then
+`claude plugin update applydesk@bilie-skills`, then start a new Claude session.
+Every ApplyDesk result shows the running version (`"v"`), and `doctor` says when a
+newer one is installed or available.
 
 ## ApplyDesk in one minute
 

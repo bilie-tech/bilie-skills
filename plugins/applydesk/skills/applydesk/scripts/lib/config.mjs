@@ -5,6 +5,9 @@ import { join, dirname } from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, appendFileSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// Kept equal to plugin.json and marketplace.json by a unit test.
+export const VERSION = '0.3.0';
+
 export const SCRIPTS_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 export const SKILL_DIR = dirname(SCRIPTS_DIR);
 

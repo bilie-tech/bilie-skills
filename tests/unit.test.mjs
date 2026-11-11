@@ -2,7 +2,7 @@
 // Each test file gets its own throwaway APPLYDESK_HOME.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -308,6 +308,8 @@ test('signed in means LinkedIn signed-in navigation, not just the address', () =
   const base = { url: 'https://www.linkedin.com/jobs/', loginForm: false, password: false, nav: [] };
   assert.equal(LI.signedInFrom({ ...base, nav: ['join now', 'sign in'] }), false); // public jobs page
   assert.equal(LI.signedInFrom({ ...base, nav: ['home', 'my network', 'jobs', 'messaging', 'notifications', 'me'] }), true);
+  assert.equal(LI.signedInFrom({ ...base, nav: [], memberLinks: true }), true); // icons only, no labels
+  assert.equal(LI.signedInFrom({ ...base, nav: ['join now'], memberLinks: true }), false);
   assert.equal(LI.signedInFrom({ ...base, url: 'https://www.linkedin.com/login', loginForm: true, password: true }), false);
   assert.equal(LI.signedInFrom({ ...base, nav: ['messaging'], password: true }), false);
   assert.equal(LI.signedInFrom({ ...base, url: 'https://www.linkedin.com/checkpoint/challenge/x', nav: ['messaging'] }), false);
@@ -385,4 +387,66 @@ test('a draft fills the form back in over the saved client', () => {
   assert.equal(c.consent.linkedin_session, false); // unticked in the draft
   assert.match(formPage('t', c), /name="consent_cv_upload" checked/);
   assert.equal(prefill(saved, null), saved);
+});
+
+// ---- 0.3.0: setup, doctor and versions ----
+const D = await import(`${L}/doctor.mjs`);
+const SEATS = await import(`${L}/seats.mjs`);
+const CFG = await import(`${L}/config.mjs`);
+
+test('BitLocker states each get a plain explanation', () => {
+  assert.equal(D.bitlockerStatus('1').on, true);
+  assert.equal(D.bitlockerStatus('3\r\n').on, true);
+  const waiting = D.bitlockerStatus('7');
+  assert.equal(waiting.on, false);
+  assert.match(waiting.detail, /waiting to finish/);
+  assert.match(waiting.fix, /Microsoft account/);
+  assert.match(waiting.fix, /manage-bde -protectors -add C: -TPM/);
+  assert.match(D.bitlockerStatus('5').fix, /manage-bde -protectors -enable C:/);
+  assert.match(D.bitlockerStatus('').detail, /unknown/);
+  assert.ok(D.bitlockerStatus('').fix);
+});
+
+test('npm runs without the deprecated shell option', () => {
+  const [cmd, args] = D.npmCommand(['install', 'x'], { platform: 'win32', execPath: 'C:\\node\\node.exe', exists: () => true });
+  assert.equal(cmd, 'C:\\node\\node.exe');
+  assert.match(args[0], /npm-cli\.js$/);
+  assert.deepEqual(D.npmCommand(['i'], { platform: 'win32', execPath: 'C:\\n\\node.exe', exists: () => false }), ['cmd.exe', ['/d', '/s', '/c', 'npm', 'i']]);
+});
+
+test('seat sign-in checks give a firm answer', () => {
+  assert.equal(SEATS.seatState({ url: 'https://x.example/login', password: true }).state, 'no');
+  assert.equal(SEATS.seatState({ url: 'https://x.example/home', signOut: true }).state, 'yes');
+  assert.equal(SEATS.seatState({ url: 'https://x.example/home', signIn: true }).state, 'no');
+  assert.equal(SEATS.seatState({ url: 'https://x.example/home' }).state, 'unknown');
+});
+
+test('setup next steps follow what is actually done', () => {
+  const op = { id: 'op', pacten_url: 'https://pacten.example' };
+  assert.deepEqual(SEATS.setupNext(op, { 'resume-worded': { state: 'yes' }, pacten: { state: 'yes' } }), ['Setup is done. Next: applydesk client new']);
+  const left = SEATS.setupNext(op, { 'resume-worded': { state: 'yes' } });
+  assert.ok(left.includes('applydesk setup --signin pacten'));
+  assert.ok(!left.some((s) => s.includes('resume-worded')));
+  assert.ok(SEATS.setupNext({ id: 'op' }, {}).some((s) => s.includes('--pacten-url')));
+});
+
+test('version: one number everywhere, and newer copies are pointed out', () => {
+  const plugin = JSON.parse(readFileSync(join(import.meta.dirname, '../plugins/applydesk/.claude-plugin/plugin.json'), 'utf8'));
+  const market = JSON.parse(readFileSync(join(import.meta.dirname, '../.claude-plugin/marketplace.json'), 'utf8'));
+  assert.equal(CFG.VERSION, plugin.version);
+  assert.equal(CFG.VERSION, market.plugins.find((p) => p.name === 'applydesk').version);
+  assert.ok(D.newer('0.10.0', '0.9.9'));
+  assert.ok(!D.newer('0.3.0', '0.3.0'));
+  const cache = mkdtempSync(join(tmpdir(), 'ad-cache-'));
+  for (const v of ['0.2.0', '0.3.0']) mkdirSync(join(cache, 'applydesk', v, 'skills', 'applydesk'), { recursive: true });
+  assert.deepEqual(D.installedVersions(join(cache, 'applydesk', '0.3.0', 'skills', 'applydesk')).sort(), ['0.2.0', '0.3.0']);
+  assert.deepEqual(D.installedVersions('/repo/plugins/applydesk/skills/applydesk'), []);
+});
+
+test('doctor notes a newer installed or published version', async () => {
+  const n1 = await D.versionNotes({ installed: ['0.2.0', CFG.VERSION, '9.0.0'], published: null });
+  assert.match(n1[0], /9\.0\.0 is installed/);
+  const n2 = await D.versionNotes({ installed: [], published: '9.1.0' });
+  assert.match(n2[0], /9\.1\.0 is available/);
+  assert.deepEqual(await D.versionNotes({ installed: [], published: CFG.VERSION }), []);
 });

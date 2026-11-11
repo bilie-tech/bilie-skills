@@ -44,7 +44,9 @@ export function signInSignalsInPage() {
     .slice(0, 60);
   const password = Boolean(document.querySelector('input[type="password"]'));
   const loginForm = password && Boolean(document.querySelector('input[name="session_key"], input#username, input[autocomplete="username"], input[type="email"]'));
-  return { url: location.href, nav, password, loginForm };
+  // Links only members get, whether or not the labels are showing (narrow windows show icons only).
+  const memberLinks = Boolean(document.querySelector('a[href*="/messaging/"], a[href*="/notifications/"]'));
+  return { url: location.href, nav, password, loginForm, memberLinks };
 }
 
 export function signedInFrom(s) {
@@ -54,7 +56,7 @@ export function signedInFrom(s) {
   const nav = s.nav || [];
   if (nav.some((t) => /^(join now|sign in|sign up|join)$/.test(t))) return false;
   // Only signed-in members get Messaging and Notifications in the top bar.
-  return nav.some((t) => /^(messaging|notifications)\b/.test(t));
+  return Boolean(s.memberLinks) || nav.some((t) => /^(messaging|notifications)\b/.test(t));
 }
 
 export async function checkSignedIn(page) {

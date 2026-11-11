@@ -3,8 +3,9 @@
 // enforces the session-safety rules before any LinkedIn work is allowed.
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { home, runtimeDir, ensureDir, paths, writeJson, loadOperator } from './config.mjs';
+import { join, dirname } from 'node:path';
+import { home, runtimeDir, ensureDir, paths, writeJson, loadOperator, VERSION, SKILL_DIR } from './config.mjs';
+import { basename } from 'node:path';
 import { DEPS, OPTIONAL_DEPS, depsInstalled, need } from './deps.mjs';
 import { findBrowser } from './browser.mjs';
 
@@ -17,24 +18,47 @@ export function installDeps() {
   const pkg = join(dir, 'package.json');
   if (!existsSync(pkg)) writeFileSync(pkg, JSON.stringify({ name: 'applydesk-runtime', private: true }, null, 2));
   const specs = Object.entries({ ...DEPS, ...OPTIONAL_DEPS }).map(([n, v]) => `${n}@${v}`);
-  const r = spawnSync('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', ...specs], {
-    cwd: dir,
-    shell: process.platform === 'win32', // npm is npm.cmd on Windows
-    encoding: 'utf8',
-  });
-  return { ok: r.status === 0, output: (r.stderr || r.stdout || '').slice(-600) };
+  const r = spawnSync(...npmCommand(['install', '--no-audit', '--no-fund', '--loglevel=error', ...specs]), { cwd: dir, encoding: 'utf8', windowsHide: true });
+  return { ok: r.status === 0, output: (r.stderr || r.stdout || r.error?.message || '').slice(-600) };
 }
 
-// BitLocker / FileVault. Windows: shell property readable without admin rights
-// (1 = on, 3 = encrypting, 2 = off, 0 = not available).
+// npm without `shell: true` (deprecated, DEP0190): run npm's own script with this
+// Node when it sits beside it (the usual install), else npm.cmd through cmd.exe.
+export function npmCommand(args, { platform = process.platform, execPath = process.execPath, exists = existsSync } = {}) {
+  const cli = join(dirname(execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (exists(cli)) return [execPath, [cli, ...args]];
+  if (platform === 'win32') return ['cmd.exe', ['/d', '/s', '/c', 'npm', ...args]];
+  return ['npm', args];
+}
+
+const RECOVERY = 'Keep the recovery password somewhere safe that is not this computer (print it, or save it to the Microsoft account).';
+const FINISH = `Device encryption is switched on but waiting to finish: Windows needs somewhere to keep the recovery key. Either sign in to Windows with a Microsoft account (Settings > Accounts > Your info), or in a terminal opened with "Run as administrator" run: manage-bde -protectors -add C: -TPM ; manage-bde -protectors -add C: -RecoveryPassword ; manage-bde -protectors -enable C:  ${RECOVERY}`;
+
+// Windows shell property System.Volume.BitLockerProtection, readable without admin rights.
+export function bitlockerStatus(raw) {
+  const v = Number(String(raw ?? '').trim());
+  const known = {
+    1: { on: true, detail: 'BitLocker on' },
+    3: { on: true, detail: 'BitLocker encrypting (fine to use)' },
+    6: { on: true, detail: 'BitLocker on (locked)' },
+    2: { on: false, detail: 'BitLocker off', fix: 'Turn on Device encryption (Settings > Privacy & security > Device encryption) or BitLocker' },
+    0: { on: false, detail: 'BitLocker not available on this drive', fix: 'This drive cannot be encrypted with BitLocker. Use a computer with Device encryption or BitLocker.' },
+    4: { on: false, detail: 'BitLocker decrypting (being turned off)', fix: 'Encryption is being turned off. Turn Device encryption or BitLocker back on.' },
+    5: { on: false, detail: 'BitLocker suspended', fix: `Encryption is paused. In a terminal opened with "Run as administrator": manage-bde -protectors -enable C:` },
+    7: { on: false, detail: 'Device encryption waiting to finish (code 7)', fix: FINISH },
+  };
+  if (String(raw ?? '').trim() !== '' && known[v]) return known[v];
+  return { on: false, detail: `unknown BitLocker state (${String(raw ?? '').trim() || 'no answer'})`, fix: `Open Settings > Privacy & security > Device encryption and check it says On. If it says it is waiting for you to sign in: ${FINISH}` };
+}
+
+// BitLocker / FileVault.
 export function diskEncryption(platform = process.platform) {
   try {
     if (platform === 'win32') {
       const drive = (process.env.SystemDrive || 'C:').replace(/\\$/, '');
       const ps = `(New-Object -ComObject Shell.Application).NameSpace('${drive}\\').Self.ExtendedProperty('System.Volume.BitLockerProtection')`;
-      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 15000 });
-      const v = Number(String(r.stdout).trim());
-      return { on: v === 1 || v === 3, detail: { 1: 'BitLocker on', 3: 'BitLocker encrypting', 2: 'BitLocker off', 0: 'BitLocker not available' }[v] || `unknown (${String(r.stdout).trim()})` };
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+      return bitlockerStatus(r.stdout);
     }
     if (platform === 'darwin') {
       const r = spawnSync('fdesetup', ['status'], { encoding: 'utf8', timeout: 10000 });
@@ -65,6 +89,43 @@ export function findExportedSessions(root = home()) {
   };
   walk(root, 0);
   return hits;
+}
+
+export function newer(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  return false;
+}
+
+// Claude Code keeps each plugin version in its own folder: .../applydesk/<version>/skills/applydesk.
+export function installedVersions(skillDir = SKILL_DIR) {
+  const versionDir = dirname(dirname(skillDir));
+  if (!/^\d+\.\d+\.\d+$/.test(basename(versionDir))) return [];
+  try {
+    return readdirSync(dirname(versionDir)).filter((d) => /^\d+\.\d+\.\d+$/.test(d));
+  } catch {
+    return [];
+  }
+}
+
+async function latestPublished() {
+  try {
+    const res = await fetch('https://raw.githubusercontent.com/bilie-tech/bilie-skills/main/plugins/applydesk/.claude-plugin/plugin.json', { signal: AbortSignal.timeout(4000) });
+    return res.ok ? (await res.json()).version : null;
+  } catch {
+    return null;
+  }
+}
+
+// Notes about the running version. Never fail the doctor: they are advice.
+export async function versionNotes({ installed = installedVersions(), published } = {}) {
+  const notes = [];
+  const newest = installed.filter((v) => newer(v, VERSION)).sort((a, b) => (newer(a, b) ? -1 : 1))[0];
+  if (newest) notes.push(`ApplyDesk ${newest} is installed but ${VERSION} is running. Start a new Claude session so the skill loads ${newest}.`);
+  const pub = published === undefined ? await latestPublished() : published;
+  if (pub && newer(pub, VERSION) && !newest) notes.push(`ApplyDesk ${pub} is available (running ${VERSION}). Update: claude plugin marketplace update bilie-skills, then claude plugin update applydesk@bilie-skills, then start a new session.`);
+  return notes;
 }
 
 export async function doctor({ fix = false } = {}) {
@@ -100,7 +161,7 @@ export async function doctor({ fix = false } = {}) {
   const enc = diskEncryption();
   const allowUnencrypted = process.env.APPLYDESK_ALLOW_UNENCRYPTED === '1';
   checks.push(check('disk encryption', enc.on || allowUnencrypted, enc.detail + (allowUnencrypted && !enc.on ? ' (override set: TEST ONLY)' : ''),
-    process.platform === 'win32' ? 'Turn on BitLocker / Device encryption (Settings > Privacy & security > Device encryption)' : 'Turn on FileVault (System Settings > Privacy & Security)'));
+    enc.fix || (process.platform === 'win32' ? 'Turn on Device encryption (Settings > Privacy & security > Device encryption) or BitLocker' : 'Turn on FileVault (System Settings > Privacy & Security)')));
 
   const exported = findExportedSessions();
   checks.push(check('no exported sessions', exported.length === 0, exported.length ? exported.join('; ') : 'clean', 'Delete those files: sessions must stay inside browser profiles'));
@@ -109,7 +170,8 @@ export async function doctor({ fix = false } = {}) {
   checks.push(check('operator setup', op, op ? `operator ${op.id}` : 'not set up', 'Run: applydesk setup --operator <your-name>'));
 
   const sessionSafe = ['node', 'packages', 'browser', 'disk encryption', 'no exported sessions'].every((n) => checks.find((c) => c.name === n)?.ok);
-  const report = { at: new Date().toISOString(), platform: process.platform, ready: checks.every((c) => c.ok), linkedin_allowed: sessionSafe, checks };
+  const notes = await versionNotes();
+  const report = { at: new Date().toISOString(), version: VERSION, platform: process.platform, ready: checks.every((c) => c.ok), linkedin_allowed: sessionSafe, checks, notes };
   writeJson(paths.state('doctor.json'), report);
   return report;
 }

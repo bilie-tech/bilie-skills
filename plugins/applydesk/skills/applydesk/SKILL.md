@@ -37,8 +37,14 @@ Every step is one command. Run it with Node from this skill's folder:
 node "<this skill folder>/scripts/applydesk.mjs" <command> [args]
 ```
 
-On Windows use the same line in PowerShell (forward slashes work). Each command
-prints **one JSON line**:
+`<this skill folder>` is the exact "Base directory for this skill" path shown when
+this skill loaded. Never type a path from memory or from an older session, and pass
+that same path to any worker agent: a plugin update leaves the old version's folder
+on disk, and running it gives old behaviour. Every result has `"v"`, the version
+that ran.
+
+On Windows use the same line in PowerShell (forward slashes work). Give commands a
+10-minute tool timeout. Each command prints **one JSON line**:
 
 | status | meaning | what you do |
 |---|---|---|
@@ -51,27 +57,52 @@ and `page read` over screenshots.
 
 ## First run on a machine
 
+0. Check Node.js first: `node --version` must print v20 or newer. If it is missing
+   on Windows, ask the operator to run `winget install OpenJS.NodeJS.LTS` (or the
+   bootstrap script in the README), then open a new terminal. Don't go on without it.
 1. `doctor --fix`: installs packages and checks the browser, keychain and disk
-   encryption. Fix anything it lists.
-2. `setup --operator <name> --pacten-url <url>`
-3. `setup --signin resume-worded`, then `setup --signin pacten`. The operator signs
-   in to their own seats. Then `setup --check`.
+   encryption. Read each FAIL's `fix` to the operator in plain words. `notes` say when
+   a newer ApplyDesk is installed or available.
+2. `setup --operator <name> --pacten-url <url>`. Its `next` lists only what is
+   still left to do.
+3. `setup --signin resume-worded` and `setup --signin pacten`: the operator signs in
+   to their own seats. Then `setup --check`, which answers yes, no or unknown for
+   each. On unknown, ask the operator to look at the window.
 
 ## The flow for each client
 
-**1. Onboard**: `client new` opens a form. Only the client ID and full name are
-required, so save what you have and add the rest later with `client edit <id>`
-(the form opens with everything already saved). The result lists what is still
-`missing` and what each gap blocks: target titles for searches, the master CV
-(.docx) for tailored CVs, LinkedIn consent for sittings, CV-upload consent for
-Resume Worded. Tell the operator what to collect next. Never fill a gap with a
-guess.
+**1. Onboard**: `client new` starts the form in the background and returns at
+once (`blocked`, because a person fills it in) with `form_url`. Always give the
+operator that address in case no window appeared. Only the client ID and full name
+are required. The form saves a draft as they type and stays open while it is in
+use; if it closes, `client new` again brings the draft back. When the operator says
+they saved it, run `client form`: it shows the saved client, any `warnings`, and
+what is still `missing` and what each gap blocks (target titles for searches, the
+master CV for tailored CVs, LinkedIn consent for sittings, CV-upload consent for
+Resume Worded). The CV can be Word (.docx) or PDF.
+
+To fix or fill one field: `client set <id> <field> <value>` (checked the same way
+as the form, e.g. `client set sam-lee city "San Diego"`). For many fields, or
+consents, use `client edit <id>`. Never fill a gap with a guess.
 
 **2. Sitting** (client present):
-- `sitting start <client> --present`: opens the client's LinkedIn window. The first
-  time, the client signs in themselves. Later sittings usually start signed in.
-- `discover linkedin <client>`: runs their searches and saves each job, with its
-  description and route: **Easy Apply** or **employer site**.
+- `sitting start <client> --present`: opens the client's LinkedIn window. If the
+  client is not signed in, it returns `blocked`: tell the client to sign in in that
+  window, wait until they say they're done, then run `sitting start` again. It
+  checks for real signed-in pages and never reloads over the sign-in form. Nothing
+  else touches LinkedIn until it says `signed in`. `ends_by_local` is the
+  operator's local time.
+- `discover linkedin <client>`: runs their searches (10 jobs by default, up to 7
+  minutes) and saves each job as it goes, with its route: **Easy Apply**,
+  **employer site**, or **unknown**. A job that won't load is retried once, then
+  counted in `failed` and skipped. Run it again for more (`more_available`).
+- Jobs saved as `incomplete` (LinkedIn page not fully read) get `job fetch` in the
+  sitting. If that still fails: `sitting read <client> --job <job>` shows what the
+  page holds (read-only), and the operator can fix it by hand with
+  `job set <client> <job> --title "..." --company "..." [--location ...] [--route easy|employer]`
+  and `job jd <client> <job> <file>`. CVs are never tailored for an incomplete job.
+- If a LinkedIn window stops responding, run the command again: ApplyDesk reconnects
+  to it or closes it cleanly.
 - If Easy Apply jobs already have CVs ready, go through them now (step 5).
 - `sitting end` when the client leaves.
 

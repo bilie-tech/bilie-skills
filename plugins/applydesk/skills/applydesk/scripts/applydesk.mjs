@@ -7,7 +7,7 @@
 import { existsSync, readFileSync, writeFileSync, rmSync, readdirSync, copyFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
-  paths, readJson, writeJson, loadClient, loadOperator, linkedinProfileName, applyProfileName, toolsProfileName, today, UserError, ensureDir, home,
+  paths, readJson, writeJson, loadClient, loadOperator, linkedinProfileName, applyProfileName, toolsProfileName, today, UserError, ensureDir, home, VERSION, SKILL_DIR,
 } from './lib/config.mjs';
 import { ok, fail, blocked, say } from './lib/out.mjs';
 import { doctor } from './lib/doctor.mjs';
@@ -20,8 +20,8 @@ import { checkCv, jdKeywords } from './lib/cvcheck.mjs';
 import { scan as scanForm, planFill, setField, answerSheet, SUBMIT_TEXT, ATTEST } from './lib/form.mjs';
 import { pactenRecord, appendCsv } from './lib/tracker.mjs';
 import * as RW from './lib/rw.mjs';
+import { seatSignalsInPage, seatState, recordSignin, setupNext } from './lib/seats.mjs';
 
-const VERSION = '0.2.0';
 
 // ---------- tiny arg parser ----------
 function parse(argv) {
@@ -114,6 +114,7 @@ const commands = {
   async help() {
     return ok('help', {
       version: VERSION,
+      skill_folder: SKILL_DIR,
       data: home(),
       commands: [
         'doctor [--fix]',
@@ -141,7 +142,8 @@ const commands = {
   async doctor({ flags }) {
     const r = await doctor({ fix: Boolean(flags.fix) });
     for (const c of r.checks) say(`${c.ok ? 'OK  ' : 'FAIL'} ${c.name}: ${c.detail}${c.fix ? `  -> ${c.fix}` : ''}`);
-    return (r.ready ? ok : fail)('doctor', r.ready ? undefined : 'Some checks failed', { linkedin_allowed: r.linkedin_allowed, failed: r.checks.filter((c) => !c.ok) });
+    for (const n of r.notes) say(`NOTE ${n}`);
+    return (r.ready ? ok : fail)('doctor', r.ready ? undefined : 'Some checks failed', { version: VERSION, skill_folder: SKILL_DIR, linkedin_allowed: r.linkedin_allowed, failed: r.checks.filter((c) => !c.ok), notes: r.notes.length ? r.notes : undefined });
   },
 
   async setup({ flags }) {
@@ -155,7 +157,7 @@ const commands = {
         created_at: prev.created_at || new Date().toISOString(),
       };
       writeJson(paths.operator(), op);
-      return ok('setup', { operator: op.id, next: 'Run: applydesk setup --signin resume-worded, then: applydesk setup --signin pacten' });
+      return ok('setup', { operator: op.id, pacten_url: op.pacten_url, next: setupNext(op) });
     }
     const op = requireOperator();
     const profile = toolsProfileName(op.id);
@@ -168,23 +170,32 @@ const commands = {
         await page.goto(url, { waitUntil: 'domcontentloaded' });
         await page.bringToFront();
       });
-      return blocked('setup', `Operator: sign in to ${site} yourself in the window that just opened. Then run: applydesk setup --check`);
+      return blocked('setup', `Operator: sign in to ${site} yourself in the window that just opened, then tell me. I will check it with: applydesk setup --check`);
     }
     if (flags.check) {
       const out = {};
+      const look = async (page, site, url) => {
+        try {
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+          const r = seatState(await page.evaluate(seatSignalsInPage));
+          // A signed-out Resume Worded page often has no form, only a sign-up pitch.
+          if (site === 'resume-worded' && r.state !== 'no' && RW.looksSignedOut(page.url(), await pageText(page))) Object.assign(r, { state: 'no', why: 'the page asks you to log in or sign up' });
+          recordSignin(site, r);
+          out[site] = { signed_in: r.state, why: r.why };
+        } catch (e) {
+          out[site] = { signed_in: 'unknown', why: e.message.split('\n')[0] };
+        }
+      };
       await withProfile(profile, async (ctx) => {
         const page = await ctx.newPage();
-        await page.goto(op.resume_worded?.score_url || RW.RW_DEFAULTS.score_url, { waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(2000);
-        out.resume_worded = RW.looksSignedOut(page.url(), await pageText(page)) ? 'signed out' : 'signed in (probably — confirm the page shows your account)';
-        if (op.pacten_url) {
-          await page.goto(op.pacten_url, { waitUntil: 'domcontentloaded' });
-          await page.waitForTimeout(2000);
-          out.pacten = /login|sign.?in/i.test(page.url()) ? 'signed out' : 'signed in (probably)';
-        } else out.pacten = 'no URL configured';
+        await look(page, 'resume-worded', op.resume_worded?.score_url || RW.RW_DEFAULTS.score_url);
+        if (op.pacten_url) await look(page, 'pacten', op.pacten_url);
+        else out.pacten = { signed_in: 'no', why: 'no Pacten address set' };
         await page.close();
       });
-      return ok('setup', out);
+      const unsure = Object.entries(out).filter(([, v]) => v.signed_in === 'unknown').map(([k]) => k);
+      return ok('setup', { ...out, next: setupNext(op), look: unsure.length ? `Could not tell for ${unsure.join(', ')}: look at the ApplyDesk window and say whether it shows your account.` : undefined });
     }
     return fail('setup', 'Use --operator, --signin or --check');
   },

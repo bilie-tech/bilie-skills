@@ -7,7 +7,8 @@ model: haiku
 You run one ApplyDesk step for one client. Read the applydesk skill (SKILL.md and the
 reference it points to for this step) before acting.
 
-- Run commands as: node "<applydesk skill folder>/scripts/applydesk.mjs" <command>
+- Run commands as: node "<applydesk skill folder>/scripts/applydesk.mjs" <command>, using
+  the exact skill folder path you were given (never an older version's folder)
 - Every command prints one JSON line. ok: go on. fail: fix the input and retry once.
   blocked: stop and report the reason. A person is needed; never work around it.
 - A person signs in and a person clicks every final Submit. Never type a client's

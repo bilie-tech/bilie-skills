@@ -1,6 +1,7 @@
 // Client onboarding form: a one-page web form served on 127.0.0.1 with a
-// one-time token. The operator fills it in with the client (on a call), clicks
-// Save, and the server writes client.json + the master CV, then exits.
+// one-time token. The operator fills in what they know (only the ID and name are
+// required), clicks Save, and the server writes client.json + the master CV, then
+// exits. The rest is added later with `client edit`.
 // No passwords are collected: the client signs in to LinkedIn themselves, in a sitting.
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -12,9 +13,16 @@ import { docxToMarkdown } from './docs.mjs';
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
-function page(token, c = {}) {
+export function formPage(token, c = {}) {
   const v = (k) => esc(Array.isArray(c[k]) ? c[k].join(', ') : c[k]);
   const sel = (k, opts) => opts.map(([val, label]) => `<option value="${val}" ${c[k] === val ? 'selected' : ''}>${label}</option>`).join('');
+  // Yes/no answers are stored as true/false/null; null means nobody has asked yet.
+  const yn = (k, first = 'yes') => {
+    const cur = c[k] === true ? 'yes' : c[k] === false ? 'no' : '';
+    const opts = [['', 'Not asked yet'], ...(first === 'yes' ? [['yes', 'Yes'], ['no', 'No']] : [['no', 'No'], ['yes', 'Yes']])];
+    return opts.map(([val, label]) => `<option value="${val}" ${cur === val ? 'selected' : ''}>${label}</option>`).join('');
+  };
+  const ticked = (k) => (c.consent?.[k] ? ' checked' : '');
   const tz = esc(c.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone);
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ApplyDesk — client onboarding</title>
@@ -30,24 +38,24 @@ input,select,textarea{font:inherit;padding:8px 10px;border:1px solid var(--line)
 button{margin-top:24px;font:600 1rem system-ui;padding:12px 22px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
 #msg{margin-top:14px;font-weight:600}
 </style></head><body><main>
-<h1>Client onboarding</h1><p class="m">Fill this in with the client. It is saved on this computer only. Do not enter any passwords here.</p>
+<h1>Client onboarding</h1><p class="m">Only the client ID and full name are required. Fill in what you have now and add the rest later (ask the agent to edit the client). It is saved on this computer only. Do not enter any passwords here.</p>
 <form id="f" enctype="multipart/form-data">
 <input type="hidden" name="token" value="${token}">
 <h2>Who</h2><div class="grid">
 <label>Client ID <span>short, no spaces, e.g. jane-doe</span><input name="id" required pattern="[a-z0-9-]{2,40}" value="${v('id')}"></label>
 <label>Full name<input name="full_name" required value="${v('full_name')}"></label>
-<label>Email used for applications<input type="email" name="email" required value="${v('email')}"></label>
-<label>Phone<input name="phone" required value="${v('phone')}"></label>
-<label>City<input name="city" required value="${v('city')}"></label>
+<label>Email used for applications<input type="email" name="email" value="${v('email')}"></label>
+<label>Phone<input name="phone" value="${v('phone')}"></label>
+<label>City<input name="city" value="${v('city')}"></label>
 <label>Province / state<input name="region" value="${v('region')}"></label>
-<label>Country<input name="country" required value="${v('country')}"></label>
+<label>Country<input name="country" value="${v('country')}"></label>
 <label>Postal code<input name="postal_code" value="${v('postal_code')}"></label>
-<label class="full">LinkedIn profile URL<input type="url" name="linkedin_url" required placeholder="https://www.linkedin.com/in/..." value="${v('linkedin_url')}"></label>
+<label class="full">LinkedIn profile URL<input type="url" name="linkedin_url" placeholder="https://www.linkedin.com/in/..." value="${v('linkedin_url')}"></label>
 <label>Website / portfolio<input name="website" value="${v('website')}"></label>
 <label>Current employer<input name="current_company" value="${v('current_company')}"></label>
 </div>
 <h2>What they want</h2><div class="grid">
-<label class="full">Target job titles <span>comma separated, most important first</span><input name="target_titles" required value="${v('target_titles')}"></label>
+<label class="full">Target job titles <span>comma separated, most important first</span><input name="target_titles" value="${v('target_titles')}"></label>
 <label>Seniority<select name="seniority">${sel('seniority', [['entry', 'Entry'], ['mid', 'Mid'], ['senior', 'Senior'], ['lead', 'Lead / manager'], ['director', 'Director+']])}</select></label>
 <label>Industries<input name="industries" value="${v('industries')}"></label>
 <label>Locations <span>comma separated</span><input name="locations" value="${v('locations')}"></label>
@@ -61,22 +69,23 @@ button{margin-top:24px;font:600 1rem system-ui;padding:12px 22px;border:0;border
 <label>Max job age (days)<input name="max_age_days" inputmode="numeric" value="${v('max_age_days') || 14}"></label>
 </div>
 <h2>Standard answers</h2><div class="grid">
-<label>Legally allowed to work in target country?<select name="work_authorized">${sel('work_authorized', [['yes', 'Yes'], ['no', 'No']])}</select></label>
-<label>Needs visa sponsorship?<select name="needs_sponsorship">${sel('needs_sponsorship', [['no', 'No'], ['yes', 'Yes']])}</select></label>
-<label>Willing to relocate?<select name="willing_to_relocate">${sel('willing_to_relocate', [['no', 'No'], ['yes', 'Yes']])}</select></label>
-<label>Availability / notice period<input name="availability" value="${v('availability') || '2 weeks'}"></label>
+<label>Legally allowed to work in target country?<select name="work_authorized">${yn('work_authorized')}</select></label>
+<label>Needs visa sponsorship?<select name="needs_sponsorship">${yn('needs_sponsorship', 'no')}</select></label>
+<label>Willing to relocate?<select name="willing_to_relocate">${yn('willing_to_relocate', 'no')}</select></label>
+<label>Availability / notice period<input name="availability" value="${v('availability')}"></label>
 <label class="full">Career gaps or anything recruiters should know<textarea name="considerations">${v('considerations')}</textarea></label>
 <label>Client time zone<input name="timezone" value="${tz}"></label>
 </div>
 <h2>Master CV</h2>
-<label>Upload the client's current CV (.docx) <input type="file" name="cv" accept=".docx" ${c.id ? '' : 'required'}></label>
+<label>Upload the client's current CV (.docx) <span>${c.master_cv ? 'one is saved; upload only to replace it' : 'needed before CVs can be tailored'}</span><input type="file" name="cv" accept=".docx"></label>
 <h2>Consent</h2>
+<p class="m">Tick only what the client has agreed to. LinkedIn sittings need the first box, Resume Worded scoring the second.</p>
 <div class="consent">
-<label class="check"><input type="checkbox" name="consent_linkedin" required> The client will sign in to LinkedIn themselves, on this computer, during sittings when they are present (in person or by screen share). During a sitting ApplyDesk searches LinkedIn jobs for them and opens Easy Apply jobs for them to submit. ApplyDesk never sees their password and never opens their LinkedIn when they are not present. They understand LinkedIn's User Agreement restricts automated tools, that LinkedIn may restrict their account, and that they can end it at any time with LinkedIn's "Sign out of all sessions".</label>
-<label class="check"><input type="checkbox" name="consent_cv_upload" required> The client agrees their CV may be uploaded to Resume Worded for quality checks.</label>
-<label class="check"><input type="checkbox" name="consent_inbox"> The client authorises reading their job-search inbox for employer replies and verification codes.</label>
-<label class="check"><input type="checkbox" name="consent_privacy_notices"> The client authorises ticking employers' privacy-notice boxes on their behalf. (Legal attestations are always ticked by a person.)</label>
-<label>Consent recorded by (operator name)<input name="consent_by" required value="${v('consent_by')}"></label>
+<label class="check"><input type="checkbox" name="consent_linkedin"${ticked('linkedin_session')}> The client will sign in to LinkedIn themselves, on this computer, during sittings when they are present (in person or by screen share). During a sitting ApplyDesk searches LinkedIn jobs for them and opens Easy Apply jobs for them to submit. ApplyDesk never sees their password and never opens their LinkedIn when they are not present. They understand LinkedIn's User Agreement restricts automated tools, that LinkedIn may restrict their account, and that they can end it at any time with LinkedIn's "Sign out of all sessions".</label>
+<label class="check"><input type="checkbox" name="consent_cv_upload"${ticked('cv_upload')}> The client agrees their CV may be uploaded to Resume Worded for quality checks.</label>
+<label class="check"><input type="checkbox" name="consent_inbox"${ticked('inbox')}> The client authorises reading their job-search inbox for employer replies and verification codes.</label>
+<label class="check"><input type="checkbox" name="consent_privacy_notices"${ticked('privacy_notices')}> The client authorises ticking employers' privacy-notice boxes on their behalf. (Legal attestations are always ticked by a person.)</label>
+<label>Consent recorded by (operator name) <span>needed if any box is ticked</span><input name="consent_by" value="${esc(c.consent?.recorded_by)}"></label>
 </div>
 <button type="submit">Save client</button><div id="msg" role="status"></div>
 </form></main>
@@ -92,47 +101,76 @@ document.getElementById('f').addEventListener('submit', async (e) => {
 }
 
 const list = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+const text = (s) => String(s ?? '').trim() || null;
+const yesNo = (s) => (s === 'yes' ? true : s === 'no' ? false : null);
+
+// What's still empty and what it blocks, so the agent can say what to ask the client for.
+export const NEEDED = {
+  email: 'employer forms', phone: 'employer forms', city: 'employer forms', country: 'employer forms',
+  linkedin_url: 'employer forms', target_titles: 'job searches', master_cv: 'tailored CVs',
+  consent_linkedin: 'LinkedIn sittings', consent_cv_upload: 'Resume Worded scores',
+};
+
+export function missingInfo(c) {
+  const has = {
+    email: c.email, phone: c.phone, city: c.city, country: c.country, linkedin_url: c.linkedin_url,
+    target_titles: c.target_titles?.length, master_cv: c.master_cv,
+    consent_linkedin: c.consent?.linkedin_session, consent_cv_upload: c.consent?.cv_upload,
+  };
+  return Object.keys(NEEDED).filter((k) => !has[k]);
+}
 
 export function toClient(form, existing = {}) {
-  const [first, ...rest] = String(form.full_name).trim().split(/\s+/);
+  const id = slug(form.id || '');
+  const full_name = text(form.full_name);
+  if (!id || !full_name) throw new Error('The client ID and full name are required');
+  const [first, ...rest] = full_name.split(/\s+/);
+  const consent = {
+    linkedin_session: Boolean(form.consent_linkedin),
+    cv_upload: Boolean(form.consent_cv_upload),
+    inbox: Boolean(form.consent_inbox),
+    privacy_notices: Boolean(form.consent_privacy_notices),
+  };
+  const anyConsent = Object.values(consent).some(Boolean);
+  const recorded_by = text(form.consent_by);
+  if (anyConsent && !recorded_by) throw new Error('Enter the operator name under "Consent recorded by"');
+  const prev = existing.consent || {};
+  const same = Object.keys(consent).every((k) => Boolean(prev[k]) === consent[k]) && prev.recorded_by === recorded_by;
   return {
     ...existing,
-    id: slug(form.id),
-    full_name: form.full_name.trim(),
+    id,
+    full_name,
     first_name: first,
     last_name: rest.join(' '),
-    email: form.email.trim(),
-    phone: form.phone.trim(),
-    city: form.city, region: form.region || null, country: form.country, postal_code: form.postal_code || null,
-    linkedin_url: form.linkedin_url.trim(),
-    website: form.website || null,
-    current_company: form.current_company || null,
+    email: text(form.email),
+    phone: text(form.phone),
+    city: text(form.city), region: text(form.region), country: text(form.country), postal_code: text(form.postal_code),
+    linkedin_url: text(form.linkedin_url),
+    website: text(form.website),
+    current_company: text(form.current_company),
     target_titles: list(form.target_titles),
-    seniority: form.seniority,
+    seniority: form.seniority || null,
     industries: list(form.industries),
     locations: list(form.locations),
-    remote: form.remote,
+    remote: form.remote || 'any',
     salary_min: form.salary_min ? Number(form.salary_min) : null,
-    currency: form.currency || null,
-    salary_answer: form.salary_answer || null,
+    currency: text(form.currency),
+    salary_answer: text(form.salary_answer),
     preferred_employers: list(form.preferred_employers),
     excluded_employers: list(form.excluded_employers),
     excluded_keywords: list(form.excluded_keywords),
     max_age_days: Number(form.max_age_days) || 14,
-    work_authorized: form.work_authorized === 'yes',
-    needs_sponsorship: form.needs_sponsorship === 'yes',
-    willing_to_relocate: form.willing_to_relocate === 'yes',
-    availability: form.availability || null,
+    work_authorized: yesNo(form.work_authorized),
+    needs_sponsorship: yesNo(form.needs_sponsorship),
+    willing_to_relocate: yesNo(form.willing_to_relocate),
+    availability: text(form.availability),
     considerations: form.considerations || '',
-    timezone: form.timezone,
+    timezone: text(form.timezone),
     eeo_answers: existing.eeo_answers || { gender: 'decline', ethnicity: 'decline', veteran: 'decline', disability: 'decline' },
     consent: {
-      linkedin_session: Boolean(form.consent_linkedin),
-      cv_upload: Boolean(form.consent_cv_upload),
-      inbox: Boolean(form.consent_inbox),
-      privacy_notices: Boolean(form.consent_privacy_notices),
-      recorded_by: form.consent_by,
-      recorded_at: new Date().toISOString(),
+      ...consent,
+      recorded_by,
+      recorded_at: same && prev.recorded_at ? prev.recorded_at : anyConsent ? new Date().toISOString() : null,
     },
     created_at: existing.created_at || new Date().toISOString(),
   };
@@ -152,7 +190,7 @@ export function runOnboarding(existingId, { open = true, timeoutMin = 60, onUrl 
       const url = new URL(req.url, 'http://127.0.0.1');
       if (req.method === 'GET' && url.pathname === '/' && url.searchParams.get('t') === token) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-        return res.end(page(token, existing));
+        return res.end(formPage(token, existing));
       }
       if (req.method === 'POST' && url.pathname === '/save') {
         try {

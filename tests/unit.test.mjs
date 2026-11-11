@@ -14,7 +14,7 @@ const { checkCv } = await import(`${L}/cvcheck.mjs`);
 const { planFill, answerSheet, SUBMIT_TEXT } = await import(`${L}/form.mjs`);
 const { addJob, getJob, listJobs } = await import(`${L}/jobs.mjs`);
 const { pactenRecord, appendCsv } = await import(`${L}/tracker.mjs`);
-const { toClient } = await import(`${L}/onboard.mjs`);
+const { toClient, formPage, missingInfo } = await import(`${L}/onboard.mjs`);
 const { findBrowser } = await import(`${L}/browser.mjs`);
 const { slug, linkedinProfileName, applyProfileName } = await import(`${L}/config.mjs`);
 const { verdict } = await import('../plugins/applydesk/hooks/guard.mjs');
@@ -33,6 +33,39 @@ test('onboarding builds a client with no working-hours or caps fields', () => {
   assert.equal(client.consent.linkedin_session, true);
   assert.equal(client.working_hours, undefined);
   assert.equal(client.linkedin, undefined);
+});
+
+test('onboarding: only the client ID and name are required', () => {
+  const html = formPage('tok');
+  const required = [...html.matchAll(/<(input|select|textarea)[^>]*\brequired\b[^>]*>/g)].map((m) => m[0].match(/name="([^"]+)"/)[1]);
+  assert.deepEqual(required.sort(), ['full_name', 'id']);
+  const c = toClient({ id: 'sam', full_name: 'Sam Lee' });
+  assert.equal(c.id, 'sam');
+  assert.equal(c.first_name, 'Sam');
+  assert.equal(c.email, null);
+  assert.deepEqual(c.target_titles, []);
+  // Yes/no answers nobody asked about stay unknown, never a guessed Yes/No.
+  assert.equal(c.work_authorized, null);
+  assert.equal(c.needs_sponsorship, null);
+  assert.equal(c.consent.linkedin_session, false);
+  const missing = missingInfo(c);
+  for (const k of ['email', 'phone', 'linkedin_url', 'target_titles', 'master_cv', 'consent_linkedin']) assert.ok(missing.includes(k), k);
+  assert.deepEqual(missingInfo(client).filter((k) => k !== 'master_cv'), []);
+});
+
+test('onboarding: a ticked consent needs the operator name', () => {
+  assert.throws(() => toClient({ id: 'sam', full_name: 'Sam Lee', consent_linkedin: 'on' }), /operator/i);
+});
+
+test('onboarding: editing keeps consents and fills in the gaps', () => {
+  const first = toClient({ id: 'sam', full_name: 'Sam Lee', consent_linkedin: 'on', consent_by: 'op' });
+  const html = formPage('tok', first);
+  assert.match(html, /name="consent_linkedin" checked/);
+  const later = toClient({ id: 'sam', full_name: 'Sam Lee', email: 'sam@example.com', consent_linkedin: 'on', consent_by: 'op' }, first);
+  assert.equal(later.email, 'sam@example.com');
+  assert.equal(later.consent.linkedin_session, true);
+  assert.equal(later.consent.recorded_at, first.consent.recorded_at);
+  assert.equal(later.created_at, first.created_at);
 });
 
 test('each client gets separate LinkedIn and apply profiles', () => {

@@ -165,10 +165,15 @@ const commands = {
   async client({ pos }) {
     const [sub, id] = pos;
     if (sub === 'new' || sub === 'edit') {
-      const { runOnboarding } = await import('./lib/onboard.mjs');
-      say('Opening the onboarding form in your browser. Fill it in with the client and click Save.');
+      const { runOnboarding, missingInfo, NEEDED } = await import('./lib/onboard.mjs');
+      say('Opening the onboarding form in your browser. Fill in what you have (only ID and name are required) and click Save.');
       const c = await runOnboarding(sub === 'edit' ? id : null);
-      return ok('client', { client: c.id, master_cv: Boolean(c.master_cv), next: `When the client is present: applydesk sitting start ${c.id} --present` });
+      const missing = missingInfo(c);
+      return ok('client', {
+        client: c.id, master_cv: Boolean(c.master_cv),
+        missing: missing.map((k) => `${k} (needed for ${NEEDED[k]})`),
+        next: missing.length ? `Add the rest when you have it: applydesk client edit ${c.id}` : `When the client is present: applydesk sitting start ${c.id} --present`,
+      });
     }
     if (sub === 'list') {
       const open = LI.activeSitting();
@@ -191,8 +196,9 @@ const commands = {
     }
     if (sub === 'show') {
       const c = loadClient(id);
+      const { missingInfo } = await import('./lib/onboard.mjs');
       const { consent, eeo_answers, ...rest } = c;
-      return ok('client', { client: rest, consent, linkedin_hold: LI.lastHold(c.id) });
+      return ok('client', { client: rest, consent, missing: missingInfo(c), linkedin_hold: LI.lastHold(c.id) });
     }
     return fail('client', 'Use: client new | edit <id> | list | show <id>');
   },
@@ -288,6 +294,7 @@ const commands = {
     }
     if (src !== 'linkedin') return fail('discover', 'Use: discover linkedin|ats|links <client>');
 
+    if (!client.target_titles?.length) return blocked('discover', `No target job titles for ${client.id} yet. Add them: applydesk client edit ${client.id}`);
     const why = LI.sittingProblem(client.id);
     if (why) return blocked('discover', why);
     const max = Number(flags.max || 25);

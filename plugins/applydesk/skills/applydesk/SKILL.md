@@ -59,8 +59,13 @@ and `page read` over screenshots.
 
 ## The flow for each client
 
-**1. Onboard** (once): `client new` opens a form. Fill it in with the client and
-upload their CV (.docx). Record consent.
+**1. Onboard**: `client new` opens a form. Only the client ID and full name are
+required, so save what you have and add the rest later with `client edit <id>`
+(the form opens with everything already saved). The result lists what is still
+`missing` and what each gap blocks: target titles for searches, the master CV
+(.docx) for tailored CVs, LinkedIn consent for sittings, CV-upload consent for
+Resume Worded. Tell the operator what to collect next. Never fill a gap with a
+guess.
 
 **2. Sitting** (client present):
 - `sitting start <client> --present`: opens the client's LinkedIn window. The first

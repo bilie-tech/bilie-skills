@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { home, runtimeDir, ensureDir, paths, writeJson, loadOperator } from './config.mjs';
-import { DEPS, depsInstalled, need } from './deps.mjs';
+import { DEPS, OPTIONAL_DEPS, depsInstalled, need } from './deps.mjs';
 import { findBrowser } from './browser.mjs';
 
 function check(name, okay, detail, fix) {
@@ -16,7 +16,7 @@ export function installDeps() {
   const dir = ensureDir(runtimeDir());
   const pkg = join(dir, 'package.json');
   if (!existsSync(pkg)) writeFileSync(pkg, JSON.stringify({ name: 'applydesk-runtime', private: true }, null, 2));
-  const specs = Object.entries(DEPS).map(([n, v]) => `${n}@${v}`);
+  const specs = Object.entries({ ...DEPS, ...OPTIONAL_DEPS }).map(([n, v]) => `${n}@${v}`);
   const r = spawnSync('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', ...specs], {
     cwd: dir,
     shell: process.platform === 'win32', // npm is npm.cmd on Windows
@@ -75,7 +75,7 @@ export async function doctor({ fix = false } = {}) {
   ensureDir(home());
   checks.push(check('data folder', existsSync(home()), home()));
 
-  if (!depsInstalled() && fix) {
+  if (!depsInstalled(true) && fix) {
     const r = installDeps();
     checks.push(check('install packages', r.ok, r.ok ? `installed into ${runtimeDir()}` : r.output, 'Check internet access / npm proxy settings'));
   }

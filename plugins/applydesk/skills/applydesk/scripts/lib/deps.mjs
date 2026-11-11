@@ -12,11 +12,22 @@ export const DEPS = {
   mammoth: '1.13.0',
 };
 
-export function depsInstalled() {
-  return Object.keys(DEPS).every((name) => existsSync(join(runtimeDir(), 'node_modules', ...name.split('/'), 'package.json')));
+// Installed by `doctor --fix` too, but a machine set up before they existed keeps
+// working without them until a feature needs one.
+export const OPTIONAL_DEPS = {
+  unpdf: '1.9.1', // PDF CVs
+};
+
+const installed = (name) => existsSync(join(runtimeDir(), 'node_modules', ...name.split('/'), 'package.json'));
+
+export function depsInstalled(all = false) {
+  return Object.keys(all ? { ...DEPS, ...OPTIONAL_DEPS } : DEPS).every(installed);
 }
 
 export function need(name) {
+  if (OPTIONAL_DEPS[name] && !installed(name)) {
+    throw new UserError(`This needs a package that is not installed yet (${name}). Run: applydesk doctor --fix`);
+  }
   if (!depsInstalled()) {
     throw new UserError('Runtime packages are not installed yet. Run: applydesk doctor --fix');
   }

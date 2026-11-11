@@ -15,7 +15,7 @@ const { planFill, answerSheet, SUBMIT_TEXT } = await import(`${L}/form.mjs`);
 const { addJob, getJob, listJobs, mergeFetched, routeOf } = await import(`${L}/jobs.mjs`);
 const { parseJob, parseJobTitle, applyRoute, htmlToText } = await import(`${L}/lijob.mjs`);
 const { pactenRecord, appendCsv } = await import(`${L}/tracker.mjs`);
-const { toClient, formPage, missingInfo } = await import(`${L}/onboard.mjs`);
+const { toClient, formPage, missingInfo, normalizeField, titleWarnings, sniffCv, prefill, matchCountry, matchTimezone, FormError } = await import(`${L}/onboard.mjs`);
 const { findBrowser } = await import(`${L}/browser.mjs`);
 const { slug, linkedinProfileName, applyProfileName } = await import(`${L}/config.mjs`);
 const { verdict } = await import('../plugins/applydesk/hooks/guard.mjs');
@@ -321,4 +321,68 @@ test('LinkedIn work needs a confirmed sign-in, not only an open sitting', () => 
   LI.markSignedIn('sam');
   assert.equal(LI.sittingProblem('sam'), null);
   LI.endSitting('test');
+});
+
+// ---- 0.3.0: onboarding checks ----
+
+test('LinkedIn profile addresses are accepted as typed', () => {
+  assert.equal(normalizeField('linkedin_url', 'linkedin.com/in/jane-doe').value, 'https://www.linkedin.com/in/jane-doe');
+  assert.equal(normalizeField('linkedin_url', 'www.linkedin.com/in/jane-doe/').value, 'https://www.linkedin.com/in/jane-doe');
+  assert.equal(normalizeField('linkedin_url', 'https://ca.linkedin.com/in/jane').value, 'https://www.linkedin.com/in/jane');
+  assert.match(normalizeField('linkedin_url', 'linkedin.com/company/acme').error, /linkedin\.com\/in/);
+  assert.equal(normalizeField('linkedin_url', '').value, null);
+});
+
+test('country and time zone come from real lists, with common spellings matched', () => {
+  assert.equal(matchCountry('United state of America'), 'United States');
+  assert.equal(matchCountry('usa'), 'United States');
+  assert.equal(matchCountry('canada'), 'Canada');
+  assert.equal(matchCountry('Narnia'), null);
+  assert.match(normalizeField('country', 'Narnia').error, /pick it from the list/i);
+  assert.equal(matchTimezone('PST (UTC-8)'), 'America/Los_Angeles');
+  assert.equal(matchTimezone('America/Toronto'), 'America/Toronto');
+  assert.equal(normalizeField('timezone', 'nowhere').error !== undefined, true);
+});
+
+test('likely typos in target titles are flagged, real titles are not', () => {
+  assert.match(titleWarnings(['Software Enginer'])[0], /did you mean "engineer"/);
+  assert.deepEqual(titleWarnings(['Senior Data Analyst', 'Product Manager', 'DevOps Engineer']), []);
+  assert.ok(normalizeField('target_titles', 'Data Anaylst, Engineer').warnings.length >= 1);
+});
+
+test('a street address in City is warned about, yes/no answers parse', () => {
+  assert.equal(normalizeField('city', '123 Main St, San Diego, CA').warnings.length, 1);
+  assert.equal(normalizeField('city', 'San Diego').warnings.length, 0);
+  assert.equal(normalizeField('work_authorized', 'yes').value, true);
+  assert.equal(normalizeField('work_authorized', 'unknown').value, null);
+  assert.match(normalizeField('work_authorized', 'maybe').error, /yes, no or unknown/);
+  assert.match(normalizeField('shoe_size', '9').error, /Unknown field/);
+});
+
+test('every problem in a saved form is reported at once', () => {
+  try {
+    toClient({ id: 'sam', full_name: '', country: 'Narnia', linkedin_url: 'example.com/x' });
+    assert.fail('should throw');
+  } catch (e) {
+    assert.ok(e instanceof FormError);
+    assert.deepEqual(Object.keys(e.errors).sort(), ['country', 'full_name', 'linkedin_url']);
+  }
+});
+
+test('CV files are recognised by their contents, not their name', () => {
+  assert.equal(sniffCv(Buffer.from('PK\x03\x04rest', 'latin1')), 'docx');
+  assert.equal(sniffCv(Buffer.from('%PDF-1.7')), 'pdf');
+  assert.equal(sniffCv(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0, 0, 0, 0])), 'doc');
+  assert.equal(sniffCv(Buffer.from('hello world')), 'unknown');
+});
+
+test('a draft fills the form back in over the saved client', () => {
+  const saved = toClient({ id: 'sam', full_name: 'Sam Lee', city: 'Toronto', consent_linkedin: 'on', consent_by: 'op' });
+  const c = prefill(saved, { full_name: 'Sam Lee', city: 'Ottawa', work_authorized: 'yes', consent_cv_upload: 'on', consent_by: 'op' });
+  assert.equal(c.city, 'Ottawa');
+  assert.equal(c.work_authorized, true);
+  assert.equal(c.consent.cv_upload, true);
+  assert.equal(c.consent.linkedin_session, false); // unticked in the draft
+  assert.match(formPage('t', c), /name="consent_cv_upload" checked/);
+  assert.equal(prefill(saved, null), saved);
 });

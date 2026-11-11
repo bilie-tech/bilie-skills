@@ -19,7 +19,7 @@ const run = process.env.APPLYDESK_E2E === '1';
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLI = join(ROOT, 'plugins/applydesk/skills/applydesk/scripts/applydesk.mjs');
 const HOME = mkdtempSync(join(tmpdir(), 'applydesk-e2e-'));
-const env = { ...process.env, APPLYDESK_HOME: HOME, APPLYDESK_HEADLESS: '1', APPLYDESK_ALLOW_UNENCRYPTED: '1' };
+const env = { ...process.env, APPLYDESK_HOME: HOME, APPLYDESK_HEADLESS: '1', APPLYDESK_ALLOW_UNENCRYPTED: '1', APPLYDESK_NO_OPEN: '1' };
 process.env.APPLYDESK_HOME = HOME;
 if (env.APPLYDESK_RUNTIME) process.env.APPLYDESK_RUNTIME = env.APPLYDESK_RUNTIME;
 
@@ -75,7 +75,7 @@ test('end to end on a practice job site', { skip: !run && 'set APPLYDESK_E2E=1 t
     await markdownToDocx(masterMd, masterDocx);
     const { runOnboarding } = await import('../plugins/applydesk/skills/applydesk/scripts/lib/onboard.mjs');
     let formUrl;
-    const saved = runOnboarding(null, { open: false, onUrl: (u) => (formUrl = u) });
+    const saved = runOnboarding(null, { onUrl: (u) => (formUrl = u) });
     while (!formUrl) await new Promise((r) => setTimeout(r, 50));
     const html = await (await fetch(formUrl)).text();
     const token = html.match(/name="token" value="([0-9a-f]+)"/)[1];
@@ -84,7 +84,7 @@ test('end to end on a practice job site', { skip: !run && 'set APPLYDESK_E2E=1 t
     for (const [k, v] of Object.entries(fields)) fd.set(k, v);
     fd.set('cv', new Blob([readFileSync(masterDocx)]), 'master.docx');
     assert.equal((await fetch(new URL('/save', formUrl), { method: 'POST', body: fd })).status, 200);
-    const client = await saved;
+    const { client } = await saved;
     assert.equal(client.id, 'jane-doe');
     assert.match(readFileSync(client.master_cv.md, 'utf8'), /Northwind/);
 
@@ -186,4 +186,43 @@ test('LinkedIn page reader and sign-in check on saved pages (real browser)', { s
   });
   const { closeProfile } = await import(`${S}/browser.mjs`);
   await closeProfile('fixture-reader');
+});
+
+test('onboarding form in the background: drafts, PDF CV, one-field edits (real CLI)', { skip: !run }, async () => {
+  const opened = await cli('client', 'new');
+  assert.equal(opened.status, 'blocked', JSON.stringify(opened)); // a person fills it in
+  assert.match(opened.form_url, /^http:\/\/127\.0\.0\.1:\d+\/\?t=/);
+  const html = await (await fetch(opened.form_url)).text();
+  const token = html.match(/name="token" value="([0-9a-f]+)"/)[1];
+  assert.match(html, /<option[^>]*>United States<\/option>/);
+
+  // typing saves a draft; reopening the page brings it back
+  const d = await fetch(new URL('/draft', opened.form_url), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, id: 'sam-lee', full_name: 'Sam Lee', city: 'San Diego' }) });
+  assert.ok((await d.json()).expires_at);
+  assert.match(await (await fetch(opened.form_url)).text(), /value="San Diego"/);
+  assert.equal((await cli('client', 'new')).form_url, opened.form_url); // same form, not a second one
+
+  // a renamed non-Word file is refused in plain words; a PDF is accepted
+  const bad = new FormData();
+  for (const [k, v] of Object.entries({ token, id: 'sam-lee', full_name: 'Sam Lee' })) bad.set(k, v);
+  bad.set('cv', new Blob(['not a word file']), 'cv.docx');
+  const refused = await (await fetch(new URL('/save', opened.form_url), { method: 'POST', body: bad })).json();
+  assert.match(refused.errors.cv, /not a real Word \.docx or a PDF/);
+  const fd = new FormData();
+  for (const [k, v] of Object.entries({ token, id: 'sam-lee', full_name: 'Sam Lee', city: 'San Diego', country: 'United States', linkedin_url: 'linkedin.com/in/sam-lee', target_titles: 'Data Analyst' })) fd.set(k, v);
+  fd.set('cv', new Blob([readFileSync(join(ROOT, 'tests/fixtures/sample-cv.pdf'))]), 'cv.pdf');
+  const res = await fetch(new URL('/save', opened.form_url), { method: 'POST', body: fd });
+  assert.equal(res.status, 200, await res.clone().text());
+  let form;
+  for (let i = 0; i < 20 && (form = await cli('client', 'form')).form !== 'saved'; i++) await new Promise((r) => setTimeout(r, 250));
+  assert.equal(form.client, 'sam-lee', JSON.stringify(form));
+  const shown = (await cli('client', 'show', 'sam-lee')).client;
+  assert.equal(shown.linkedin_url, 'https://www.linkedin.com/in/sam-lee');
+  assert.equal(shown.master_cv.source, 'pdf');
+  assert.match(readFileSync(shown.master_cv.md, 'utf8'), /Data analyst with 5 years/);
+
+  // one field at a time, checked like the form
+  assert.equal((await cli('client', 'set', 'sam-lee', 'country', 'usa')).now, 'United States');
+  assert.equal((await cli('client', 'set', 'sam-lee', 'timezone', 'Narnia')).status, 'fail');
+  assert.equal((await cli('client', 'set', 'sam-lee', 'consent_linkedin', 'yes')).status, 'blocked');
 });

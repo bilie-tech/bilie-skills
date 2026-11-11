@@ -118,7 +118,7 @@ const commands = {
       commands: [
         'doctor [--fix]',
         'setup --operator <name> [--pacten-url <url>] [--rw-cap <n>] | setup --signin resume-worded|pacten | setup --check',
-        'client new | client edit <id> | client list | client show <id>',
+        'client new | client edit <id> | client form | client set <id> <field> <value> | client list | client show <id>',
         'sitting start <client> --present [--wait <seconds>]   the client is here; they sign in to LinkedIn themselves',
         'sitting status | sitting end | sitting forget <client> | sitting read <client> [--job <job>] [--max <chars>]   (read-only, for diagnosis)',
         'discover linkedin <client> [--max <n>] [--pages <n>] [--minutes <n>]   (in a sitting)',
@@ -191,16 +191,50 @@ const commands = {
 
   async client({ pos }) {
     const [sub, id] = pos;
+    const O = await import('./lib/onboard.mjs');
     if (sub === 'new' || sub === 'edit') {
-      const { runOnboarding, missingInfo, NEEDED } = await import('./lib/onboard.mjs');
-      say('Opening the onboarding form in your browser. Fill in what you have (only ID and name are required) and click Save.');
-      const c = await runOnboarding(sub === 'edit' ? id : null);
-      const missing = missingInfo(c);
-      return ok('client', {
-        client: c.id, master_cv: Boolean(c.master_cv),
-        missing: missing.map((k) => `${k} (needed for ${NEEDED[k]})`),
-        next: missing.length ? `Add the rest when you have it: applydesk client edit ${c.id}` : `When the client is present: applydesk sitting start ${c.id} --present`,
+      if (sub === 'edit') loadClient(id);
+      // The form runs in the background, so this returns at once with its address.
+      const st = await O.startFormProcess(sub === 'edit' ? id : null);
+      const op = loadOperator();
+      const opened = await O.openForm(st.url, { toolsProfile: op ? toolsProfileName(op.id) : null });
+      say(`Onboarding form: ${st.url}`);
+      return blocked('client', `The onboarding form is open (${opened}). If you can't see it, open this address in a browser on this computer: ${st.url}  Only the client ID and full name are required; drafts save as you type. Click Save when done, then tell me.`, {
+        form_url: st.url, opened_in: opened, open_until: local(st.expires_at), reused: st.reused || undefined,
+        then: sub === 'edit' ? `applydesk client form   (then client show ${id})` : 'applydesk client form   (shows the saved client and what is still missing)',
       });
+    }
+    if (sub === 'serve') return O.serveForm(id || null); // background process started by client new/edit
+    if (sub === 'form') {
+      const st = readJson(O.formStateFile(), null);
+      if (!st) return ok('client', { form: 'none open' });
+      if (st.status === 'saved') {
+        return ok('client', {
+          form: 'saved', client: st.saved_client, saved_at: local(st.saved_at), warnings: st.warnings?.length ? st.warnings : undefined,
+          missing: st.missing.map((k) => `${k} (needed for ${O.NEEDED[k]})`),
+          next: st.missing.length ? `Add the rest when you have it: applydesk client edit ${st.saved_client}, or client set ${st.saved_client} <field> <value>` : `When the client is present: applydesk sitting start ${st.saved_client} --present`,
+        });
+      }
+      if (st.status === 'open') return blocked('client', `The form is still open and not saved yet: ${st.url}`, { form_url: st.url, open_until: local(st.expires_at) });
+      return ok('client', { form: st.status, reason: st.reason, next: 'The draft is kept. Open the form again with client new (or client edit <id>).' });
+    }
+    if (sub === 'set') {
+      const c = loadClient(id);
+      const [, , field, ...words] = pos;
+      if (!field) return fail('client', `Use: client set <id> <field> <value>. Fields: ${Object.keys(O.FIELDS).join(', ')}`);
+      if (/^consent/.test(field)) return blocked('client', `Consents are recorded with the client in the form, where they can read what they agree to: applydesk client edit ${c.id}`);
+      if (field === 'id') return fail('client', 'The client ID cannot change.');
+      const r = O.normalizeField(field, words.join(' '));
+      if (r.error) return fail('client', r.error);
+      const before = c[field];
+      c[field] = r.value;
+      if (field === 'full_name') {
+        if (!r.value) return fail('client', 'The full name cannot be empty.');
+        [c.first_name, ...c.last_name] = r.value.split(/\s+/);
+        c.last_name = c.last_name.join(' ');
+      }
+      writeJson(paths.clientFile(c.id), c);
+      return ok('client', { client: c.id, field, before: before ?? null, now: c[field], warnings: r.warnings.length ? r.warnings : undefined, missing: O.missingInfo(c) });
     }
     if (sub === 'list') {
       const open = LI.activeSitting();
@@ -225,11 +259,10 @@ const commands = {
     }
     if (sub === 'show') {
       const c = loadClient(id);
-      const { missingInfo } = await import('./lib/onboard.mjs');
       const { consent, eeo_answers, ...rest } = c;
-      return ok('client', { client: rest, consent, missing: missingInfo(c), linkedin_hold: LI.lastHold(c.id) });
+      return ok('client', { client: rest, consent, missing: O.missingInfo(c), linkedin_hold: LI.lastHold(c.id) });
     }
-    return fail('client', 'Use: client new | edit <id> | list | show <id>');
+    return fail('client', 'Use: client new | edit <id> | form | set <id> <field> <value> | list | show <id>');
   },
 
   async sitting({ pos, flags }) {
@@ -551,7 +584,8 @@ const commands = {
     }
     if (sub === 'scan') {
       if (budget.left <= 0) return blocked('rw', `Resume Worded monthly cap reached (${budget.cap}). Use the local check only until next month.`);
-      const docx = isMaster ? client.master_cv.docx : latestCv(id, target)?.docx;
+      // A PDF master is scanned from the clean .docx that `cv render master` makes.
+      const docx = isMaster ? client.master_cv.docx || join(paths.client(id), 'cv', 'master-clean.docx') : latestCv(id, target)?.docx;
       if (!docx || !existsSync(docx)) return blocked('rw', `Render the CV first: applydesk cv render ${id} ${target}`);
       const r = await withProfile(toolsProfileName(op.id), async (ctx) => {
         const page = await ctx.newPage();

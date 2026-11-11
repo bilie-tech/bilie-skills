@@ -14,6 +14,25 @@ export async function docxToMarkdown(file) {
     .trim() + '\n';
 }
 
+// PDF master CVs: plain text, one line per line, with likely section headings
+// ("EXPERIENCE", "Skills") turned into markdown headings so the CV check can use them.
+export async function pdfToMarkdown(file) {
+  const { extractText, getDocumentProxy } = need('unpdf');
+  const pdf = await getDocumentProxy(new Uint8Array(readFileSync(file)));
+  const { text } = await extractText(pdf, { mergePages: false });
+  const lines = [].concat(text).join('\n').split(/\r?\n/).map((l) => l.replace(/\s+/g, ' ').trim());
+  if (lines.join('').length < 40) throw new Error('almost no text found (a scanned image?)');
+  const HEAD = /^(summary|profile|about( me)?|experience|work experience|professional experience|employment( history)?|education|skills|technical skills|key skills|certifications?|projects|languages|volunteer(ing)?|awards|interests|references)$/i;
+  const out = [];
+  lines.forEach((l, i) => {
+    if (!l) return out.push('');
+    if (i === 0) return out.push(`# ${l}`);
+    if (HEAD.test(l.replace(/:$/, ''))) return out.push('', `## ${l.replace(/:$/, '').replace(/\b\w/g, (c) => c.toUpperCase()).replace(/\B\w+/g, (w) => w.toLowerCase())}`);
+    out.push(/^[•▪●◦·*-]\s*/.test(l) ? `- ${l.replace(/^[•▪●◦·*-]\s*/, '')}` : l);
+  });
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
 const inline = (docx, text, base = {}) => {
   const runs = [];
   const re = /\*\*(.+?)\*\*|\*(.+?)\*/g;
